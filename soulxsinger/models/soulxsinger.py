@@ -75,15 +75,15 @@ class SoulXSinger(nn.Module):
         is_torch = isinstance(f0, torch.Tensor)
         uv_mask = f0 <= 0    
 
-        if is_torch:  
-            f0_safe = torch.maximum(f0, torch.tensor(f0_min))
+        if is_torch:
+            f0_safe = torch.clamp(f0, min=f0_min)
             f0_cents = 1200 * torch.log2(f0_safe / f0_min)
         else:
             f0_safe = np.maximum(f0, f0_min)
             f0_cents = 1200 * np.log2(f0_safe / f0_min)
 
         f0_coarse = (f0_cents / 20) + 1
-        
+
         if is_torch:
             f0_coarse = torch.round(f0_coarse).long()
             f0_coarse = torch.clamp(f0_coarse, min=1, max=f0_bin - 1)

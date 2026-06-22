@@ -66,6 +66,7 @@ class LlamaNARDecoderLayer(LlamaDecoderLayer):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -90,14 +91,20 @@ class LlamaNARDecoderLayer(LlamaDecoderLayer):
         )
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        attn_output = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            position_embeddings=position_embeddings,
         )
+        if len(attn_output) == 3:
+            hidden_states, self_attn_weights, present_key_value = attn_output
+        else:
+            hidden_states, self_attn_weights = attn_output
+            present_key_value = None
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -129,8 +136,15 @@ class DiffLlama(LlamaModel):
         dropout=0.1,
         ffn_dropout=0.1,
         attention_dropout=0.0,
-        config=LlamaConfig(0, 256, 1024, 1, 1),
+        config=None,
     ):
+        if config is None:
+            config = LlamaConfig(
+                vocab_size=0, hidden_size=hidden_size,
+                intermediate_size=hidden_size * 4,
+                num_hidden_layers=num_layers,
+                num_attention_heads=num_heads,
+            )
         super().__init__(config)
 
         self.layers = nn.ModuleList(
@@ -309,6 +323,11 @@ class DiffLlama(LlamaModel):
 
         hidden_states = inputs_embeds
 
+        # Compute rotary position embeddings for newer transformers compatibility
+        position_embeddings = None
+        if hasattr(self, 'rotary_emb') and self.rotary_emb is not None:
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 use_cache = False
@@ -354,6 +373,7 @@ class DiffLlama(LlamaModel):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cond_embedding=diffusion_step,
+                    position_embeddings=position_embeddings,
                 )
 
             hidden_states = layer_outputs[0]

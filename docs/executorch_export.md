@@ -21,12 +21,12 @@
 
 ## 导出的模型文件
 
-| 模型文件 | 大小 | 输入 | 输出 | 说明 |
-|---------|------|------|------|------|
-| `encoder.pte` | 23.72 MB | phoneme, note_pitch, note_type, f0_coarse, mel2note | cond_feat [1, F, 1024] | 音符编码 + ConvNeXtV2 + 帧对齐 |
-| `cfm_step.pte` | 1688.72 MB | xt_input, t, cond, x_mask | flow_pred [1, F, 128] | CFM单步扩散预测 |
-| `vocos_backbone.pte` | 965.51 MB | mel [1, 128, F] | features [1, F, 1024] | Vocos骨干网络 |
-| `istft_head_linear.pte` | 7.52 MB | features [1, F, 1024] | mag_phase [1, 1922, F] | ISTFT头部Linear层 |
+| 模型文件                    | 大小         | 输入                                                     | 输出                       | 说明                      |
+| ----------------------- | ---------- | ------------------------------------------------------ | ------------------------ | ----------------------- |
+| `encoder.pte`           | 23.72 MB   | phoneme, note\_pitch, note\_type, f0\_coarse, mel2note | cond\_feat \[1, F, 1024] | 音符编码 + ConvNeXtV2 + 帧对齐 |
+| `cfm_step.pte`          | 1688.72 MB | xt\_input, t, cond, x\_mask                            | flow\_pred \[1, F, 128]  | CFM单步扩散预测               |
+| `vocos_backbone.pte`    | 965.51 MB  | mel \[1, 128, F]                                       | features \[1, F, 1024]   | Vocos骨干网络               |
+| `istft_head_linear.pte` | 7.52 MB    | features \[1, F, 1024]                                 | mag\_phase \[1, 1922, F] | ISTFT头部Linear层          |
 
 ## 模型输入输出详细规格
 
@@ -34,71 +34,73 @@
 
 **输入:**
 
-| 名称 | 形状 | 类型 | 范围 | 说明 |
-|------|------|------|------|------|
-| phoneme | [1, N] | int64 | 0-2999 | 音素ID序列 |
-| note_pitch | [1, N] | int64 | 0-255 | MIDI音高 (0=休止) |
-| note_type | [1, N] | int64 | 1-3 | 音符类型 (1=休止, 2=正常, 3=延续) |
-| f0_coarse | [1, F] | int64 | 0-360 | 量化F0 (0=清音, 1-360=C1-B6) |
-| mel2note | [1, F] | int64 | 0-N-1 | 帧到音符索引映射 |
+| 名称          | 形状      | 类型    | 范围     | 说明                       |
+| ----------- | ------- | ----- | ------ | ------------------------ |
+| phoneme     | \[1, N] | int64 | 0-2999 | 音素ID序列                   |
+| note\_pitch | \[1, N] | int64 | 0-255  | MIDI音高 (0=休止)            |
+| note\_type  | \[1, N] | int64 | 1-3    | 音符类型 (1=休止, 2=正常, 3=延续)  |
+| f0\_coarse  | \[1, F] | int64 | 0-360  | 量化F0 (0=清音, 1-360=C1-B6) |
+| mel2note    | \[1, F] | int64 | 0-N-1  | 帧到音符索引映射                 |
 
 **输出:**
 
-| 名称 | 形状 | 类型 | 说明 |
-|------|------|------|------|
-| cond_feat | [1, F, 1024] | float32 | 条件特征 |
+| 名称         | 形状            | 类型      | 说明   |
+| ---------- | ------------- | ------- | ---- |
+| cond\_feat | \[1, F, 1024] | float32 | 条件特征 |
 
 **动态维度:**
+
 - `N`: 音符数量 (1-2000)
 - `F`: 帧数量 (1-10000)
 
-### 2. CFM-Step (cfm_step.pte)
+### 2. CFM-Step (cfm\_step.pte)
 
 **输入:**
 
-| 名称 | 形状 | 类型 | 说明 |
-|------|------|------|------|
-| xt_input | [1, F_total, 128] | float32 | 当前步噪声梅尔频谱 |
-| t | [1] | float32 | 扩散时间步 [0, 1] |
-| cond | [1, F_total, 1024] | float32 | 条件嵌入 |
-| x_mask | [1, F_total] | float32 | 掩码 (全1) |
+| 名称        | 形状                   | 类型      | 说明            |
+| --------- | -------------------- | ------- | ------------- |
+| xt\_input | \[1, F\_total, 128]  | float32 | 当前步噪声梅尔频谱     |
+| t         | \[1]                 | float32 | 扩散时间步 \[0, 1] |
+| cond      | \[1, F\_total, 1024] | float32 | 条件嵌入          |
+| x\_mask   | \[1, F\_total]       | float32 | 掩码 (全1)       |
 
 **输出:**
 
-| 名称 | 形状 | 类型 | 说明 |
-|------|------|------|------|
-| flow_pred | [1, F_total, 128] | float32 | 预测的速度场 |
+| 名称         | 形状                  | 类型      | 说明     |
+| ---------- | ------------------- | ------- | ------ |
+| flow\_pred | \[1, F\_total, 128] | float32 | 预测的速度场 |
 
 **动态维度:**
-- `F_total`: 总帧数 = F_prompt + F_target (1-20000)
 
-### 3. Vocos Backbone (vocos_backbone.pte)
+- `F_total`: 总帧数 = F\_prompt + F\_target (1-20000)
 
-**输入:**
-
-| 名称 | 形状 | 类型 | 说明 |
-|------|------|------|------|
-| mel | [1, 128, F] | float32 | 梅尔频谱 |
-
-**输出:**
-
-| 名称 | 形状 | 类型 | 说明 |
-|------|------|------|------|
-| features | [1, F, 1024] | float32 | 骨干网络特征 |
-
-### 4. ISTFT Head Linear (istft_head_linear.pte)
+### 3. Vocos Backbone (vocos\_backbone.pte)
 
 **输入:**
 
-| 名称 | 形状 | 类型 | 说明 |
-|------|------|------|------|
-| features | [1, F, 1024] | float32 | 骨干网络特征 |
+| 名称  | 形状           | 类型      | 说明   |
+| --- | ------------ | ------- | ---- |
+| mel | \[1, 128, F] | float32 | 梅尔频谱 |
 
 **输出:**
 
-| 名称 | 形状 | 类型 | 说明 |
-|------|------|------|------|
-| mag_phase | [1, 1922, F] | float32 | 幅度和相位 (前961为幅度，后961为相位) |
+| 名称       | 形状            | 类型      | 说明     |
+| -------- | ------------- | ------- | ------ |
+| features | \[1, F, 1024] | float32 | 骨干网络特征 |
+
+### 4. ISTFT Head Linear (istft\_head\_linear.pte)
+
+**输入:**
+
+| 名称       | 形状            | 类型      | 说明     |
+| -------- | ------------- | ------- | ------ |
+| features | \[1, F, 1024] | float32 | 骨干网络特征 |
+
+**输出:**
+
+| 名称         | 形状            | 类型      | 说明                      |
+| ---------- | ------------- | ------- | ----------------------- |
+| mag\_phase | \[1, 1922, F] | float32 | 幅度和相位 (前961为幅度，后961为相位) |
 
 ## 推理流程
 
@@ -328,7 +330,7 @@ def extract_mel_spectrogram(
 import json
 
 # 加载音素映射表
-with open("soulxsinger/utils/phoneme/phone_set.json", "r", encoding="utf-8") as f:
+with open("docs/phone_set.json", "r", encoding="utf-8") as f:
     phone_set = json.load(f)
 
 # 音素字符串转ID
@@ -345,56 +347,56 @@ def phoneme_to_ids(phoneme_list, phone_set):
 
 ## 特殊标记
 
-| 标记 | ID | 说明 |
-|------|-----|------|
-| PAD | 0 | 填充 |
-| SP | 1 | 句子停顿 |
-| AP | 2 | 气声 |
-| BOW | 4 | 词首 |
-| EOW | 5 | 词尾 |
-| SEP | 9 | 音素分隔 (英语) |
+| 标记  | ID | 说明        |
+| --- | -- | --------- |
+| PAD | 0  | 填充        |
+| SP  | 1  | 句子停顿      |
+| AP  | 2  | 气声        |
+| BOW | 4  | 词首        |
+| EOW | 5  | 词尾        |
+| SEP | 9  | 音素分隔 (英语) |
 
 ## 推理参数
 
-| 参数 | 默认值 | 范围 | 说明 |
-|------|--------|------|------|
-| n_steps | 32 | 1-100 | 扩散步数，越多质量越好但速度越慢 |
-| cfg | 3.0 | 0-10 | Classifier-Free Guidance 强度 |
-| rescale_cfg | 0.75 | 0-1 | CFG重缩放系数 |
-| pitch_shift | 0 | -12~12 | 音高偏移 (半音) |
+| 参数           | 默认值  | 范围      | 说明                          |
+| ------------ | ---- | ------- | --------------------------- |
+| n\_steps     | 32   | 1-100   | 扩散步数，越多质量越好但速度越慢            |
+| cfg          | 3.0  | 0-10    | Classifier-Free Guidance 强度 |
+| rescale\_cfg | 0.75 | 0-1     | CFG重缩放系数                    |
+| pitch\_shift | 0    | -12\~12 | 音高偏移 (半音)                   |
 
 ## 音频配置
 
-| 参数 | 值 |
-|------|-----|
-| 采样率 | 24000 Hz |
-| hop_size | 480 (20ms) |
-| n_fft | 1920 |
-| win_size | 1920 |
-| num_mels | 128 |
-| fmin | 0 Hz |
-| fmax | 12000 Hz |
+| 参数        | 值          |
+| --------- | ---------- |
+| 采样率       | 24000 Hz   |
+| hop\_size | 480 (20ms) |
+| n\_fft    | 1920       |
+| win\_size | 1920       |
+| num\_mels | 128        |
+| fmin      | 0 Hz       |
+| fmax      | 12000 Hz   |
 
 ## 模型配置
 
-| 参数 | 值 |
-|------|-----|
-| vocab_size | 3000 |
-| text_dim | 512 |
-| pitch_dim | 512 |
-| type_dim | 512 |
-| f0_dim | 512 |
-| f0_bin | 361 |
-| hidden_size | 1024 |
-| num_layers (CFM) | 22 |
-| num_heads | 16 |
-| mel_dim | 128 |
+| 参数                | 值    |
+| ----------------- | ---- |
+| vocab\_size       | 3000 |
+| text\_dim         | 512  |
+| pitch\_dim        | 512  |
+| type\_dim         | 512  |
+| f0\_dim           | 512  |
+| f0\_bin           | 361  |
+| hidden\_size      | 1024 |
+| num\_layers (CFM) | 22   |
+| num\_heads        | 16   |
+| mel\_dim          | 128  |
 
 ## 已知限制
 
 1. **ISTFT需要CPU实现**：ExecuTorch不支持FFT/复数运算
 2. **MelSpectrogram建议CPU预处理**：STFT算子在ExecuTorch中支持有限
-3. **CFM需要循环调用**：单步模型需要在推理脚本中循环n_steps次
+3. **CFM需要循环调用**：单步模型需要在推理脚本中循环n\_steps次
 4. **CFG需要两次前向**：每个扩散步需要分别计算有条件和无条件预测
 
 ## 性能优化建议
@@ -423,6 +425,7 @@ executorch_models/
 导出脚本位于: `export_to_executorch.py`
 
 使用方法:
+
 ```bash
 python export_to_executorch.py \
     --model_dir path/to/model.pt \
@@ -430,7 +433,9 @@ python export_to_executorch.py \
 ```
 
 可选参数:
+
 - `--skip_mel`: 跳过MelSpectrogram导出
 - `--skip_encoder`: 跳过Encoder导出
 - `--skip_cfm`: 跳过CFM导出
 - `--skip_vocoder`: 跳过Vocoder导出
+

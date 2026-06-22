@@ -1,0 +1,333 @@
+{
+  "jp_pau": {
+    "strategy": "pause_mean",
+    "pause_sources": [
+      "<SP>",
+      "<AP>"
+    ],
+    "noise_std": 0.01
+  },
+  "jp_cl": {
+    "strategy": "pause_mean",
+    "pause_sources": [
+      "<SP>"
+    ],
+    "noise_std": 0.01
+  },
+  "jp_a": {
+    "sources": [
+      {
+        "phone": "en_AA1",
+        "weight": 0.8
+      },
+      {
+        "phone": "zh_a1",
+        "weight": 0.2
+      }
+    ]
+  },
+  "jp_i": {
+    "sources": [
+      {
+        "phone": "en_IY1",
+        "weight": 0.8
+      },
+      {
+        "phone": "zh_yi1",
+        "weight": 0.2
+      }
+    ]
+  },
+  "jp_u": {
+    "sources": [
+      {
+        "phone": "zh_wu1",
+        "weight": 0.6
+      },
+      {
+        "phone": "en_UH1",
+        "weight": 0.4
+      }
+    ],
+    "init_weight": 0.5,
+    "note": "JP u is unrounded; weak match, reduced init weight"
+  },
+  "jp_e": {
+    "sources": [
+      {
+        "phone": "en_EH1",
+        "weight": 0.8
+      },
+      {
+        "phone": "zh_e1",
+        "weight": 0.2
+      }
+    ]
+  },
+  "jp_o": {
+    "sources": [
+      {
+        "phone": "en_OW1",
+        "weight": 0.8
+      },
+      {
+        "phone": "zh_o1",
+        "weight": 0.2
+      }
+    ]
+  },
+  "jp_k": {
+    "sources": [
+      {
+        "phone": "en_K",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_t": {
+    "sources": [
+      {
+        "phone": "en_T",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_p": {
+    "sources": [
+      {
+        "phone": "en_P",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_g": {
+    "sources": [
+      {
+        "phone": "en_G",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_d": {
+    "sources": [
+      {
+        "phone": "en_D",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_b": {
+    "sources": [
+      {
+        "phone": "en_B",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_s": {
+    "sources": [
+      {
+        "phone": "en_S",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_z": {
+    "sources": [
+      {
+        "phone": "en_Z",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_h": {
+    "sources": [
+      {
+        "phone": "en_HH",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_n": {
+    "sources": [
+      {
+        "phone": "en_N",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_m": {
+    "sources": [
+      {
+        "phone": "en_M",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_w": {
+    "sources": [
+      {
+        "phone": "en_W",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_y": {
+    "sources": [
+      {
+        "phone": "en_Y",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_ch": {
+    "sources": [
+      {
+        "phone": "en_CH",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_j": {
+    "sources": [
+      {
+        "phone": "en_JH",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_sh": {
+    "sources": [
+      {
+        "phone": "en_SH",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_f": {
+    "sources": [
+      {
+        "phone": "en_F",
+        "weight": 1.0
+      }
+    ]
+  },
+  "jp_r": {
+    "sources": [
+      {
+        "phone": "en_L",
+        "weight": 1.0
+      }
+    ],
+    "init_weight": 0.5,
+    "note": "JP r is a tap; en_L is closest but not close. Reduced init weight."
+  },
+  "jp_ts": {
+    "sources": [
+      {
+        "phone": "en_T",
+        "weight": 0.6
+      },
+      {
+        "phone": "en_S",
+        "weight": 0.4
+      }
+    ],
+    "init_weight": 0.5,
+    "note": "JP ts is an affricate; blend doesn't match well. Reduced init weight."
+  },
+  "jp_ky": {
+    "sources": [
+      {
+        "phone": "en_K",
+        "weight": 0.6
+      },
+      {
+        "phone": "en_Y",
+        "weight": 0.4
+      }
+    ]
+  },
+  "jp_gy": {
+    "sources": [
+      {
+        "phone": "en_G",
+        "weight": 0.6
+      },
+      {
+        "phone": "en_Y",
+        "weight": 0.4
+      }
+    ]
+  },
+  "jp_ny": {
+    "sources": [
+      {
+        "phone": "en_N",
+        "weight": 0.6
+      },
+      {
+        "phone": "en_Y",
+        "weight": 0.4
+      }
+    ]
+  },
+  "jp_hy": {
+    "sources": [
+      {
+        "phone": "en_HH",
+        "weight": 0.6
+      },
+      {
+        "phone": "en_Y",
+        "weight": 0.4
+      }
+    ]
+  },
+  "jp_my": {
+    "sources": [
+      {
+        "phone": "en_M",
+        "weight": 0.6
+      },
+      {
+        "phone": "en_Y",
+        "weight": 0.4
+      }
+    ]
+  },
+  "jp_ry": {
+    "sources": [
+      {
+        "phone": "en_Y",
+        "weight": 1.0
+      }
+    ],
+    "init_weight": 0.3,
+    "note": "JP ry is palatalized tap; no good source. Minimal init from en_Y."
+  },
+  "jp_py": {
+    "sources": [
+      {
+        "phone": "en_P",
+        "weight": 0.6
+      },
+      {
+        "phone": "en_Y",
+        "weight": 0.4
+      }
+    ]
+  },
+  "jp_by": {
+    "sources": [
+      {
+        "phone": "en_B",
+        "weight": 0.6
+      },
+      {
+        "phone": "en_Y",
+        "weight": 0.4
+      }
+    ]
+  }
+}
