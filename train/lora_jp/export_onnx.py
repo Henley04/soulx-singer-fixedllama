@@ -204,7 +204,8 @@ def main():
         sess = ort.InferenceSession(fpath, providers=['CPUExecutionProvider'])
         inp = sess.get_inputs()[0]
         if 'input_ids' in inp.name:
-            test = torch.randint(0, full_embedding.shape[0], (1, 5), dtype=torch.long).numpy()
+            max_id = 3034 if 'text_encoder' in fname else 256
+            test = torch.randint(0, max_id, (1, 5), dtype=torch.long).numpy()
         else:
             test = torch.randn(1, 20, EMBED_DIM).numpy().astype('float16')
         out = sess.run(None, {inp.name: test})[0]
