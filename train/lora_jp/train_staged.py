@@ -50,9 +50,9 @@ EMBED_DIM = 512
 
 # Phase configs
 PHASE_CONFIGS = {
-    1: {"epochs": 15, "freeze_embed": True,  "embed_lr_ratio": 0.0, "loss_threshold": None},
-    2: {"epochs": 40, "freeze_embed": False, "embed_lr_ratio": 0.2, "loss_threshold": None},
-    3: {"epochs": 80, "freeze_embed": False, "embed_lr_ratio": 1.0, "loss_threshold": None},
+    1: {"epochs": 15, "freeze_embed": True,  "embed_lr_ratio": 0.0, "loss_threshold": None, "decouple": True},
+    2: {"epochs": 40, "freeze_embed": False, "embed_lr_ratio": 0.2, "loss_threshold": None, "decouple": True},
+    3: {"epochs": 80, "freeze_embed": False, "embed_lr_ratio": 1.0, "loss_threshold": None, "decouple": False},
 }
 
 
@@ -287,7 +287,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, writer,
                 # Uses direct cosine penalty (no margin) so the gradient is always
                 # pushing cos down as long as cos > 0. Target: cos < 0.85.
                 decouple_loss = torch.tensor(0.0, device=device)
-                if (not PHASE_CONFIGS[phase]["freeze_embed"]
+                if (PHASE_CONFIGS[phase].get("decouple", True)
+                        and not PHASE_CONFIGS[phase]["freeze_embed"]
                         and jp_to_en_indices is not None
                         and jp_to_en_indices):
                     embed_weight = model.note_text_encoder.weight
@@ -301,14 +302,11 @@ def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, writer,
                             # Direct cos penalty (always active when cos > 0.85 target).
                             # Squared so gradient grows for high cos values.
                             decouple_loss = decouple_loss + F.relu(cos_sim - 0.85) ** 2
-                    # lambda tuned so decouple_loss provides meaningful gradient.
-                    # With 19 entries and cos~0.99, sum ~= 19 * 0.14^2 = 0.37.
-                    # Flow-matching gradient to embedding is very indirect (through
-                    # 22 frozen DiffLlama layers + 4 ConvNeXt + expand_states), so
-                    # decouple gradient needs to dominate. lambda=100 gives:
-                    # 0.37 * 100 = 37 / 30 (flow) = 55% of total loss, and the
-                    # decouple gradient is DIRECT on the embedding (no layers).
-                    decouple_loss = decouple_loss * 100.0
+                    # Note: at cos≈0.993, the gradient d(cos)/dw → 0, so decouple
+                    # cannot start moving embeddings from cos≈1 by itself. It needs
+                    # the flow-matching gradient through diff_estimator to first
+                    # break the symmetry. Phase 3 disables decouple entirely and
+                    # relies on flow-matching signal alone.
 
                 loss = recon_loss + decouple_loss
 
