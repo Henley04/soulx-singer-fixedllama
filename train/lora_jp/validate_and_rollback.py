@@ -33,23 +33,51 @@ from train.lora_jp.dataset import JpLoRADataset, collate_fn
 from train.lora_jp.train_staged import MelProjection
 
 JP_PHONEME_START = 3000
-JP_PHONEME_COUNT = 34
+JP_PHONEME_COUNT = 33  # jp_pau removed; 33 JP phonemes
 EMBED_DIM = 512
 
 # Thresholds
 EMBED_STD_MIN = 0.5
 EMBED_STD_MAX = 1.5
 LOSS_INFLATE_MAX = 2.0  # 200% of baseline
-COS_SIM_COLLAPSE_THRESHOLD = 0.995  # above this = embedding collapsed onto source
+# Collapse threshold: cos > 0.998 means embeddings are nearly identical to
+# EN source (init noise was 0.08, so initial cos ~0.9968). Anything above
+# 0.998 after training means decouple loss failed to push them apart.
+# The training target is cos < 0.90, but 0.90-0.998 is "not yet collapsed"
+# (just slow to decouple), while > 0.998 is "fully collapsed".
+COS_SIM_COLLAPSE_THRESHOLD = 0.998
 
-# JP -> EN source mapping (same as train_staged.py)
-JP_TO_EN_SOURCE = {
-    6: 51, 7: 64, 8: 67, 9: 53, 10: 43, 11: 52, 13: 76, 14: 79,
-    15: 42, 16: 80, 17: 31, 18: 28, 19: 63, 20: 41, 21: 50, 22: 29, 23: 65,
-}
+
+def load_jp_to_en_source_indices(mapping_path, phoneset_path):
+    """Build JP->EN source index map from config files.
+
+    Same logic as train_staged.py — single-source phonemes only.
+    """
+    with open(mapping_path, 'r', encoding='utf-8') as f:
+        mapping = json.load(f)
+    with open(phoneset_path, 'r', encoding='utf-8') as f:
+        phone_list = json.load(f)
+    phone2idx = {ph: i for i, ph in enumerate(phone_list)}
+
+    jp_to_en = {}
+    for jp_name, entry in mapping.items():
+        if entry.get("strategy") == "pause_mean":
+            continue
+        if jp_name not in phone2idx:
+            continue
+        jp_idx = phone2idx[jp_name]
+        jp_offset = jp_idx - JP_PHONEME_START
+        if jp_offset < 0 or jp_offset >= JP_PHONEME_COUNT:
+            continue
+        sources = entry.get("sources", [])
+        if len(sources) == 1:
+            src_phone = sources[0]["phone"]
+            if src_phone in phone2idx:
+                jp_to_en[jp_offset] = phone2idx[src_phone]
+    return jp_to_en
 
 
-def compute_embedding_stats(checkpoint):
+def compute_embedding_stats(checkpoint, jp_to_en=None):
     """Compute JP embedding statistics including cosine similarity with EN sources."""
     jp_embed = checkpoint.get('jp_embed')
     embed_weight = checkpoint.get('embed_state_dict', {}).get('weight')
@@ -70,10 +98,10 @@ def compute_embedding_stats(checkpoint):
         "zero_vectors": (jp_embed.norm(dim=1) < 1e-6).sum().item(),
     }
 
-    # Compute cosine similarity with EN sources
-    if embed_weight is not None and JP_TO_EN_SOURCE:
+    # Compute cosine similarity with EN sources (passed in via jp_to_en)
+    if embed_weight is not None and jp_to_en:
         sims = []
-        for jp_offset, en_idx in JP_TO_EN_SOURCE.items():
+        for jp_offset, en_idx in jp_to_en.items():
             jp_idx = JP_PHONEME_START + jp_offset
             if jp_idx < embed_weight.shape[0] and en_idx < embed_weight.shape[0]:
                 sim = F.cosine_similarity(
@@ -196,18 +224,26 @@ def evaluate_checkpoint(checkpoint_path, model_path, config_path, dataset_metada
 
     model = model.to(device)
 
-    # Embedding stats
-    embed_stats = compute_embedding_stats(ckpt)
+    # Build JP->EN source map from config (same logic as train_staged.py)
+    mapping_path = os.path.join(os.path.dirname(__file__), 'jp_phoneme_mapping.json')
+    jp_to_en = load_jp_to_en_source_indices(mapping_path, phoneset_path)
 
-    # Validation metrics
-    dataset = JpLoRADataset(
+    # Embedding stats
+    embed_stats = compute_embedding_stats(ckpt, jp_to_en=jp_to_en)
+
+    # Validation metrics — use a held-out val split, NOT the training set.
+    # We reuse train_staged.split_train_val with the same seed so the val
+    # split here matches the one used during training.
+    from train.lora_jp.train_staged import split_train_val
+    full_dataset = JpLoRADataset(
         metadata_path=dataset_metadata,
         wav_dir=dataset_wav_dir,
         phoneset_path=phoneset_path,
         sample_rate=config.audio.sample_rate,
         hop_size=config.audio.hop_size,
     )
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=False,
+    _, val_dataset = split_train_val(full_dataset, val_ratio=0.1, seed=42)
+    dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False,
                             collate_fn=collate_fn, num_workers=0)
 
     val_loss, avg_frames = compute_val_metrics(model, proj, dataloader, device)

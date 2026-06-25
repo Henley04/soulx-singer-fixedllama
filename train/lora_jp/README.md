@@ -1,30 +1,53 @@
 # SoulX-Singer 日语音素微调
 
-通过微调 preflow 模块 + 扩展音素嵌入层，使 SoulX-Singer 支持日语歌声合成。
+通过三阶段微调 preflow 模块 + 扩展音素嵌入层，使 SoulX-Singer 支持日语歌声合成。
 
 ## 训练结果
 
 | 指标 | 值 |
 |------|-----|
 | 数据集 | PJS Corpus (100首歌，~15分钟) |
-| 可训练参数 | 4.25M (0.6%) |
-| 训练 Loss | 4.02 → 1.42 (50 epochs) |
+| 可训练参数 | ~4.25M (preflow + JP embedding + pitch_encoder) |
+| 训练阶段 | 三阶段 (warmup → embed FT → joint) |
 | GPU | RTX 5060 8GB (AMP) |
-| 训练耗时 | ~60秒 |
 
 ## 文件结构
 
 ```
 train/lora_jp/
-├── jp_phone_set.json      # 扩展音素表 (2820原有 + 34日语 = 2854)
-├── prepare_dataset.py      # PJS Corpus → 训练数据
-├── dataset.py              # PyTorch Dataset
-├── train_lora.py           # 训练脚本 (preflow全量微调 + JP embedding)
-├── export_onnx.py          # 导出 ONNX (FP32 + FP16)
-├── infer_lora.py           # PyTorch 推理验证
-├── run_train.sh            # 一键训练
-└── requirements.txt        # 依赖
+├── jp_phone_set.json       # 扩展音素表 (3000 base + 33 JP = 3033)
+├── jp_phoneme_mapping.json # JP 音素到 EN/ZH 源音素的映射 (配置驱动)
+├── prepare_dataset.py      # PJS Corpus → 训练数据 (含 SP/slur 样本)
+├── dataset.py              # PyTorch Dataset (确定性 wav 匹配)
+├── phoneme_mapping.py      # 生成 jp_phoneme_mapping.json
+├── init_embeddings.py      # 初始化 JP 嵌入 (只 L2 归一化 JP 行)
+├── train_staged.py         # 三阶段训练脚本 (主入口)
+├── validate_and_rollback.py # 验证 + 回滚决策 (使用独立 val 集)
+├── verify_checkpoint.py    # Checkpoint 质量检查
+├── export_onnx.py          # 导出 ONNX (text_encoder + preflow)
+├── run_pipeline.py         # 一键训练管线 (8 步)
+└── run_pipeline.sh         # Shell 包装
 ```
+
+## 音素集设计
+
+### 停顿处理（关键决策）
+
+**`jp_pau` 已删除**。SXSEditor 推理时所有停顿都使用跨语言共享的 `<SP>` (ID=1)，
+而非语言特定的 `jp_pau`。为对齐训练-推理语义，训练数据中 PJS lab 的 `pau` 标签
+直接映射到 `<SP>` (ID=1)，复用 base 模型已学好的停顿嵌入，无需新增训练。
+
+### 日语音素（索引 3000-3032，共 33 个）
+
+在原有 3000 个音素（含特殊 token 和占位符）基础上追加 33 个日语音素：
+
+| 索引范围 | 音素 | 说明 |
+|---------|------|------|
+| 3000-3004 | jp_a, jp_i, jp_u, jp_e, jp_o | 五元音 |
+| 3005-3024 | jp_k, jp_s, ..., jp_ts | 清辅音、浊辅音、摩擦音、塞擦音 |
+| 3025-3032 | jp_ky, jp_gy, ..., jp_cl | 拗音 + 促音 (jp_cl) |
+
+**注意**：`jp_pau` 已从音素表中移除，停顿统一使用 `<SP>` (ID=1)。
 
 ## 快速开始
 
@@ -32,45 +55,77 @@ train/lora_jp/
 cd SoulX-Singer
 pip install -r train/lora_jp/requirements.txt
 
-# 一键训练 (数据预处理 → 训练 → 导出ONNX)
-bash train/lora_jp/run_train.sh
+# 一键训练 (数据预处理 → 初始化 → 三阶段训练 → 验证)
+python train/lora_jp/run_pipeline.py
 ```
 
 或分步执行：
 
 ```bash
-# 1. 数据预处理
+# 1. 数据预处理 (生成 metadata.json + wavs/)
 python train/lora_jp/prepare_dataset.py
 
-# 2. 训练
-python train/lora_jp/train_lora.py --epochs 50 --batch_size 4 --use_amp
+# 2. 生成音素映射配置
+python train/lora_jp/phoneme_mapping.py
 
-# 3. 导出 ONNX
-PYTHONIOENCODING=utf-8 python train/lora_jp/export_onnx.py
+# 3. 初始化 JP 嵌入
+python train/lora_jp/init_embeddings.py \
+    --model_path pretrained_models/SoulX-Singer/model.pt \
+    --mapping train/lora_jp/jp_phoneme_mapping.json \
+    --phoneset train/lora_jp/jp_phone_set.json \
+    --output outputs/lora_jp/init_embed.pt
+
+# 4-6. 三阶段训练
+python train/lora_jp/train_staged.py --phase 1 --init_embed outputs/lora_jp/init_embed.pt
+python train/lora_jp/train_staged.py --phase 2 --resume outputs/lora_jp/stage1/best.pt
+python train/lora_jp/train_staged.py --phase 3 --resume outputs/lora_jp/stage2/best.pt
+
+# 7. 验证
+python train/lora_jp/validate_and_rollback.py --checkpoint outputs/lora_jp/stage3/best.pt
+
+# 8. 导出 ONNX
+python train/lora_jp/export_onnx.py \
+    --checkpoint outputs/lora_jp/stage3/best.pt \
+    --base_model pretrained_models/SoulX-Singer/model.pt \
+    --output_dir onnx_models/fp16/JP
 ```
-
-## 日语音素集
-
-在原有 2820 个音素基础上追加 34 个日语音素（索引 2820-2853）：
-
-| 音素 | 索引 | 说明 |
-|------|------|------|
-| jp_pau | 2820 | 静音/停顿 |
-| jp_a ~ jp_o | 2821-2825 | 五元音 |
-| jp_k ~ jp_cl | 2826-2853 | 辅音及辅音组合 |
 
 ## ONNX 兼容性
 
-导出的 ONNX 文件与现有 FP16 推理管线完全兼容：
+导出的 ONNX 文件与 SXSEditor 推理管线完全兼容：
 
-| 文件 | 大小 | 用途 |
-|------|------|------|
-| note_text_encoder.onnx | 5.9 MB | 扩展嵌入 (2854×512) |
-| note_text_encoder_fp16.onnx | 3.0 MB | FP16 版本 |
-| preflow.onnx | 16.2 MB | 微调后 preflow |
-| preflow_fp16.onnx | 16.2 MB | FP16 版本 |
+| 文件 | 用途 | 是否导出 |
+|------|------|---------|
+| note_text_encoder.onnx | 扩展嵌入 (3033×512, FP16) | ✅ |
+| preflow.onnx | 微调后 preflow (无 LayerNorm) | ✅ |
+| note_pitch_encoder.onnx | 音高嵌入 | ❌ (共享 base 模型) |
 
-**部署方式**：将 ONNX 文件替换到模型目录，同时替换 `phone_set.json` 为 `jp_phone_set.json`。
+**部署方式**：将 `note_text_encoder.onnx` 和 `preflow.onnx` 放到
+`onnx_models/fp16/JP/` 目录。SXSEditor 会自动检测 JP 模型并在日语歌词时切换。
+
+`phone_set.json` 需同步更新到 `src/inference/phone_set.json`（已包含 3033 个音素）。
+
+## 训练-推理一致性
+
+| 环节 | 一致性 |
+|------|--------|
+| BOW/EOW/SEP token | ✅ 日语不加 SEP（与英文不同） |
+| note_pitch (MIDI 0-127) | ✅ 直接索引 Embedding(256)，pitch_encoder 冻结复用 base |
+| note_type (1=SP, 2=normal, 3=slur) | ✅ 训练数据含 SP 和 slur 样本 |
+| f0 量化 (361 bins, 20 cents) | ✅ |
+| preflow 输入 (无 LayerNorm) | ✅ |
+| 停顿音素 (`<SP>` ID=1) | ✅ 训练-推理统一 |
+
+## pitch_encoder 冻结说明
+
+**pitch_encoder 在 JP LoRA 中完全冻结，不微调。** 原因：
+
+1. **pitch 是 MIDI 索引，无语种语义** — MIDI 60 在日语/英语/中文里都是 C4
+2. **base 模型已全局覆盖** — 实测 base pitch_encoder 256 行 norm 均匀（20-24），覆盖 MIDI 0-255
+3. **PJS 数据 pitch 范围窄**（36-72），微调会扭曲 base 对其他音高的建模
+4. **ONNX 导出时不导出 pitch_encoder** — 复用 base 模型，微调结果会被丢弃
+
+因此日语推理时即使用户输入 MIDI 84+（训练集外），base 模型的 pitch_encoder 也能提供合理表征。
 
 ## 自定义训练
 
@@ -90,3 +145,4 @@ PYTHONIOENCODING=utf-8 python train/lora_jp/export_onnx.py
 - mido (MIDI解析)
 - praat-parselmouth (F0提取)
 - soundfile
+- onnxruntime (ONNX 导出验证)

@@ -20,11 +20,9 @@ OUTPUT_PATH = os.path.join(SCRIPT_DIR, 'jp_phoneme_mapping.json')
 
 MAPPING = {
     # ── Special phonemes (silence) ────────────────────────────────────
-    "jp_pau": {
-        "strategy": "pause_mean",
-        "pause_sources": ["<SP>", "<AP>"],
-        "noise_std": 0.01
-    },
+    # NOTE: jp_pau removed — SXSEditor inference uses <SP> (ID=1) for all
+    # pauses. Training data maps pau -> <SP> directly, so no JP-specific
+    # pause embedding is needed. This aligns train/inference semantics.
     "jp_cl": {
         "strategy": "pause_mean",
         "pause_sources": ["<SP>"],

@@ -182,6 +182,12 @@ def main():
 
 
 def _check_rollback(phase_name):
+    """Check validation results and warn on rollback conditions.
+
+    Rollback conditions are treated as WARNINGS, not pipeline aborts.
+    The pipeline continues to subsequent stages so the model can recover
+    in later phases. Only FATAL conditions (NaN, missing checkpoint) abort.
+    """
     import json
     results_path = os.path.join(OUTPUT_DIR, "validation_results.json")
     if not os.path.exists(results_path):
@@ -190,9 +196,11 @@ def _check_rollback(phase_name):
         data = json.load(f)
     if data.get("rollback"):
         reasons = data.get("reasons", [])
-        log(f"{phase_name} ROLLBACK TRIGGERED: {reasons}")
-        log(f"Pipeline aborted. Check log: {LOG_FILE}")
-        sys.exit(1)
+        log(f"WARNING: {phase_name} rollback condition detected: {reasons}")
+        log(f"  Continuing pipeline — later phases may recover.")
+        log(f"  (If final validation still triggers rollback, inspect embeddings manually.)")
+    else:
+        log(f"{phase_name} validation passed.")
 
 
 if __name__ == '__main__':

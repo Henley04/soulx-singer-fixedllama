@@ -25,17 +25,21 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 JP_PHONEME_START = 3000
-JP_PHONEME_COUNT = 34
+JP_PHONEME_COUNT = 33  # jp_pau removed; 33 JP phonemes (jp_a..jp_cl)
 EMBED_DIM = 512
 
 
-def add_orthogonal_noise(vec, noise_scale=0.015):
+def add_orthogonal_noise(vec, noise_scale=0.08):
     """Add a tiny orthogonal perturbation to break exact copies.
 
     Generates a random vector, subtracts its projection onto vec,
     then scales the orthogonal component to noise_scale * ||vec||.
     This ensures the perturbation is perpendicular to vec,
     preserving direction while breaking cosine_sim = 1.0.
+
+    noise_scale=0.08 (8%) gives initial cos_sim ≈ 0.9968, which is
+    below the collapse threshold (0.998) and gives decouple loss room
+    to push cos down to the target 0.90 during training.
     """
     rand = torch.randn_like(vec)
     # Subtract projection onto vec: rand_orth = rand - (rand·v / ||v||²) * v
@@ -260,20 +264,38 @@ def main():
     failed_count = sum(1 for v in init_log.values() if v.get("status") == "failed")
     print(f"  OK: {ok_count}, Fallback: {fallback_count}, Failed: {failed_count}")
 
-    # Step 1: L2 normalize ALL rows (not just JP)
-    print("\nL2 normalizing all rows...")
-    embed_weight = l2_normalize_rows(embed_weight)
+    # Step 1: Gently scale JP rows to match base embedding mean norm.
+    # We do NOT L2-normalize because that would destroy the natural norm
+    # variation inherited from source embeddings. Source blends already
+    # have norms close to base embeddings (~22.5) since sources ARE base
+    # embeddings. We only apply a gentle correction if the mean norms
+    # differ by more than 10%.
+    print("\nScaling JP rows to match base mean norm (gentle correction)...")
+    base_rows = embed_weight[:JP_PHONEME_START]
+    base_mean_norm = base_rows.norm(dim=1).mean().item()
     jp_rows = embed_weight[JP_PHONEME_START:JP_PHONEME_START + JP_PHONEME_COUNT]
-    print(f"  After L2 norm - JP mean norm: {jp_rows.norm(dim=1).mean():.4f}")
-    print(f"  After L2 norm - global std: {embed_weight.std():.4f}")
+    jp_mean_norm = jp_rows.norm(dim=1).mean().item()
+    print(f"  Base mean norm: {base_mean_norm:.4f}")
+    print(f"  JP mean norm (pre-scale): {jp_mean_norm:.4f}")
 
-    # Step 2: Scale to target std
-    print(f"\nScaling to target std = {args.target_std}...")
-    embed_weight, scale_factor = scale_to_target_std(embed_weight, args.target_std)
+    if jp_mean_norm > 1e-8:
+        ratio = base_mean_norm / jp_mean_norm
+        # Only scale if deviation > 10%; otherwise preserve source blend norms
+        if abs(ratio - 1.0) > 0.10:
+            jp_scale = ratio
+            embed_weight[JP_PHONEME_START:JP_PHONEME_START + JP_PHONEME_COUNT] *= jp_scale
+            print(f"  Applied scale factor: {jp_scale:.4f} (deviation was {abs(ratio-1.0)*100:.1f}%)")
+        else:
+            jp_scale = 1.0
+            print(f"  No scaling needed (deviation {abs(ratio-1.0)*100:.1f}% < 10%)")
+    else:
+        jp_scale = 1.0
+        print(f"  WARNING: JP mean norm near zero, skipping scale")
+
     jp_rows = embed_weight[JP_PHONEME_START:JP_PHONEME_START + JP_PHONEME_COUNT]
-    print(f"  Scale factor: {scale_factor:.4f}")
-    print(f"  Final global std: {embed_weight.std():.4f}")
-    print(f"  Final JP std: {jp_rows.std():.4f}")
+    base_std = base_rows.std().item()
+    jp_std = jp_rows.std().item()
+    print(f"  Base std: {base_std:.4f}, JP std: {jp_std:.4f}")
     print(f"  Final JP mean norm: {jp_rows.norm(dim=1).mean():.4f}")
     print(f"  JP norm range: [{jp_rows.norm(dim=1).min():.4f}, {jp_rows.norm(dim=1).max():.4f}]")
 
@@ -290,7 +312,8 @@ def main():
         'jp_phoneme_start': JP_PHONEME_START,
         'jp_phoneme_count': JP_PHONEME_COUNT,
         'target_std': args.target_std,
-        'scale_factor': scale_factor,
+        'jp_scale': jp_scale,
+        'base_mean_norm': base_mean_norm,
         'init_log': init_log,
     }
     torch.save(save_dict, args.output)

@@ -14,7 +14,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 JP_PHONEME_START = 3000
-JP_PHONEME_COUNT = 34
+JP_PHONEME_COUNT = 33  # jp_pau removed; 33 JP phonemes
 
 
 def main():

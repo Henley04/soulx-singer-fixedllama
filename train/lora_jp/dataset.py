@@ -67,6 +67,33 @@ class JpLoRADataset(Dataset):
             device=device,
         )
 
+        # Build a deterministic sample_id -> wav_path mapping at __init__ time.
+        # os.listdir order is not guaranteed across platforms/runs, so we sort
+        # and match by sample_id (the "id" field in metadata) when possible,
+        # falling back to sorted index order for legacy metadata without ids.
+        self.wav_path_map = {}
+        if os.path.isdir(wav_dir):
+            wav_files = sorted(
+                f for f in os.listdir(wav_dir)
+                if f.endswith('.wav') and f.startswith('pjs')
+            )
+            # Try to match by sample_id (e.g., "pjs001" -> "pjs001.wav")
+            id_to_wav = {}
+            for wf in wav_files:
+                stem = os.path.splitext(wf)[0]
+                id_to_wav[stem] = wf
+
+            for i, meta in enumerate(self.metadata):
+                sid = meta.get("id") or meta.get("sample_id")
+                if sid and sid in id_to_wav:
+                    self.wav_path_map[i] = os.path.join(wav_dir, id_to_wav[sid])
+                elif i < len(wav_files):
+                    # Fallback: sorted-index match (deterministic)
+                    self.wav_path_map[i] = os.path.join(wav_dir, wav_files[i])
+            print(f'[JpLoRADataset] Matched {len(self.wav_path_map)}/{len(self.metadata)} wav files')
+        else:
+            print(f'[JpLoRADataset] WARNING: wav_dir does not exist: {wav_dir}')
+
         print(f'[JpLoRADataset] Loaded {len(self.metadata)} samples')
 
     def __len__(self):
@@ -94,15 +121,9 @@ class JpLoRADataset(Dataset):
         meta = copy.deepcopy(self.metadata[idx])
 
         try:
-            # Find wav file
-            wav_files = [
-                f for f in os.listdir(self.wav_dir)
-                if f.endswith('.wav') and f.startswith('pjs')
-            ]
-            # Match by index (metadata order matches wav file order)
-            if idx < len(wav_files):
-                wav_path = os.path.join(self.wav_dir, wav_files[idx])
-            else:
+            # Use pre-built wav_path_map (deterministic, built at __init__)
+            wav_path = self.wav_path_map.get(idx)
+            if wav_path is None or not os.path.exists(wav_path):
                 return None
 
             # Fix durations that are too short (< 1 mel frame) to prevent

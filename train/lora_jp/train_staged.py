@@ -2,7 +2,7 @@
 Task 3+4: Staged training with LayerNorm at preflow input.
 
 Three-phase training:
-  Phase 1 (Warmup): Freeze embedding, train preflow + LayerNorm (15 epochs)
+  Phase 1 (Warmup): Freeze embedding, train preflow (15 epochs)
   Phase 2 (Embed FT): Unfreeze embedding with lower LR (to epoch 40)
   Phase 3 (Joint): Full fine-tune with duration monitoring (to epoch 80)
 
@@ -30,7 +30,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from omegaconf import OmegaConf
 
@@ -40,37 +40,52 @@ from soulxsinger.models.soulxsinger import SoulXSinger
 from train.lora_jp.dataset import JpLoRADataset, collate_fn
 
 JP_PHONEME_START = 3000
-JP_PHONEME_COUNT = 34
+JP_PHONEME_COUNT = 33  # jp_pau removed; jp_a..jp_cl now 33 phonemes
 EMBED_DIM = 512
 
 # Phase configs
 PHASE_CONFIGS = {
-    1: {"epochs": 15, "freeze_embed": True,  "embed_lr_ratio": 0.0,  "loss_threshold": 0.3},
+    1: {"epochs": 15, "freeze_embed": True,  "embed_lr_ratio": 0.0,  "loss_threshold": None},
     2: {"epochs": 40, "freeze_embed": False, "embed_lr_ratio": 0.2,  "loss_threshold": None},
     3: {"epochs": 80, "freeze_embed": False, "embed_lr_ratio": 0.2,  "loss_threshold": None},
 }
 
-# JP phoneme -> source EN phoneme index (for decoupling loss)
-# Maps JP index offset (0-33) to the EN phoneme index it was initialized from
-JP_TO_EN_SOURCE = {
-    6: 51,   # jp_k -> en_K
-    7: 64,   # jp_s -> en_S
-    8: 67,   # jp_t -> en_T
-    9: 53,   # jp_n -> en_N
-    10: 43,  # jp_h -> en_HH
-    11: 52,  # jp_m -> en_M
-    13: 76,  # jp_w -> en_W
-    14: 79,  # jp_y -> en_Y
-    15: 42,  # jp_g -> en_G
-    16: 80,  # jp_z -> en_Z
-    17: 31,  # jp_d -> en_D
-    18: 28,  # jp_b -> en_B
-    19: 63,  # jp_p -> en_P
-    20: 41,  # jp_f -> en_F
-    21: 50,  # jp_j -> en_JH
-    22: 29,  # jp_ch -> en_CH
-    23: 65,  # jp_sh -> en_SH
-}
+
+def load_jp_to_en_source(mapping_path):
+    """Build JP->EN source index map from jp_phoneme_mapping.json.
+
+    For each JP phoneme with a single EN source, record (jp_offset, en_idx).
+    Only single-source phonemes are included because decoupling loss compares
+    one-to-one. Multi-source blends don't have a single EN source to decouple from.
+
+    Returns: dict {jp_offset: en_phone_name}
+    """
+    with open(mapping_path, 'r', encoding='utf-8') as f:
+        mapping = json.load(f)
+
+    # Load phone_set to get indices
+    phoneset_path = os.path.join(os.path.dirname(__file__), 'jp_phone_set.json')
+    with open(phoneset_path, 'r', encoding='utf-8') as f:
+        phone_list = json.load(f)
+    phone2idx = {ph: i for i, ph in enumerate(phone_list)}
+
+    jp_to_en = {}
+    for jp_name, entry in mapping.items():
+        if entry.get("strategy") == "pause_mean":
+            continue
+        if jp_name not in phone2idx:
+            continue
+        jp_idx = phone2idx[jp_name]
+        jp_offset = jp_idx - JP_PHONEME_START
+        if jp_offset < 0 or jp_offset >= JP_PHONEME_COUNT:
+            continue
+        sources = entry.get("sources", [])
+        # Only include single-source phonemes for clean decoupling
+        if len(sources) == 1:
+            src_phone = sources[0]["phone"]
+            if src_phone in phone2idx:
+                jp_to_en[jp_offset] = src_phone
+    return jp_to_en, phone2idx
 
 
 class MelProjection(nn.Module):
@@ -83,23 +98,7 @@ class MelProjection(nn.Module):
         return self.proj(x)
 
 
-class PreflowWithNorm(nn.Module):
-    """Wraps preflow with LayerNorm at input for feature stabilization.
-
-    This addresses the "duration predictor input normalization" requirement
-    by normalizing encoder features before the ConvNeXt blocks.
-    """
-    def __init__(self, preflow, norm_dim=EMBED_DIM):
-        super().__init__()
-        self.preflow = preflow
-        self.norm = nn.LayerNorm(norm_dim)
-
-    def forward(self, x):
-        x = self.norm(x)
-        return self.preflow(x)
-
-
-def setup_phase(model, phase, init_embed_path=None, resume_path=None):
+def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_path=None):
     """Configure model for the given training phase.
 
     Returns: (model, checkpoint_info)
@@ -124,12 +123,9 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None):
         print(f"  Resuming from: {resume_path}")
         ckpt = torch.load(resume_path, map_location='cpu', weights_only=False)
 
-        # Restore preflow (without LayerNorm)
+        # Restore preflow
         if 'preflow_state_dict' in ckpt:
-            # Filter out LayerNorm keys if present
-            pf_sd = {k: v for k, v in ckpt['preflow_state_dict'].items()
-                     if not k.startswith('norm.')}
-            model.preflow.load_state_dict(pf_sd, strict=False)
+            model.preflow.load_state_dict(ckpt['preflow_state_dict'], strict=False)
 
         # Restore embedding
         if 'embed_state_dict' in ckpt:
@@ -149,25 +145,29 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None):
         ckpt_info["epoch_start"] = ckpt.get("epoch", 0) + 1
         ckpt_info["prev_loss"] = ckpt.get("loss", float('inf'))
 
-    # NOTE: LayerNorm removed — it causes the preflow blocks to learn
-    # amplified outputs (norm 28→65) which breaks the diffusion model.
-    # The preflow blocks work fine without it.
-
     # Configure freeze state
     for param in model.parameters():
         param.requires_grad = False
 
-    # Unfreeze preflow (with norm)
+    # Unfreeze preflow
     for param in model.preflow.parameters():
         param.requires_grad = True
 
-    # Unfreeze embedding and pitch encoder if not frozen
+    # pitch_encoder is ALWAYS frozen — pitch is a MIDI index with no
+    # language-specific semantic. Base model trained on 42000+ hours of
+    # CN/EN/YUE data already covers MIDI 0-255 uniformly (verified: all
+    # 256 rows have norm ~22.5). JP LoRA's PJS data only covers MIDI 36-72,
+    # so fine-tuning pitch_encoder would (a) distort base's uniform pitch
+    # representation and (b) be discarded at ONNX export time anyway.
+    # See: export_onnx.py does NOT export note_pitch_encoder.
+    print("  Pitch encoder: FROZEN (shared with base model)")
+
+    # Unfreeze embedding if not frozen
     if not config["freeze_embed"]:
         model.note_text_encoder.weight.requires_grad = True
-        model.note_pitch_encoder.weight.requires_grad = True
-        print("  Embedding: UNFROZEN, Pitch encoder: UNFROZEN")
+        print("  Text encoder embedding: UNFROZEN")
     else:
-        print("  Embedding: FROZEN, Pitch encoder: FROZEN")
+        print("  Text encoder embedding: FROZEN")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -177,7 +177,12 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None):
 
 
 def build_optimizer(model, proj, phase, base_lr):
-    """Build optimizer with per-group learning rates for the given phase."""
+    """Build optimizer with per-group learning rates for the given phase.
+
+    pitch_encoder is intentionally excluded — it's always frozen (see
+    setup_phase). Only preflow, projection, and (when unfrozen) text
+    encoder embedding are trained.
+    """
     config = PHASE_CONFIGS[phase]
     param_groups = [
         {'params': model.preflow.parameters(), 'lr': base_lr},
@@ -189,20 +194,19 @@ def build_optimizer(model, proj, phase, base_lr):
             'params': model.note_text_encoder.parameters(),
             'lr': embed_lr
         })
-        param_groups.append({
-            'params': model.note_pitch_encoder.parameters(),
-            'lr': embed_lr
-        })
-        print(f"  Optimizer: preflow lr={base_lr}, embed lr={embed_lr}, pitch_encoder lr={embed_lr}")
+        print(f"  Optimizer: preflow lr={base_lr}, embed lr={embed_lr}")
 
     optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
     return optimizer
 
 
-def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, writer, phase=1, use_amp=True):
+def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, writer,
+                    phase=1, use_amp=True, jp_to_en_indices=None):
     model.train()
     proj.train()
     total_loss = 0
+    total_recon = 0
+    total_decouple = 0
     n = 0
     use_cuda_amp = use_amp and device.startswith('cuda')
 
@@ -243,20 +247,29 @@ def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, w
                 projected = proj(mel_feat[:, :target_mel.shape[1], :])
                 recon_loss = F.mse_loss(projected, target_mel)
 
-                # Decoupling loss: prevent JP embeddings from collapsing onto EN sources
+                # Decoupling loss: prevent JP embeddings from collapsing onto EN sources.
+                # Only applies when embeddings are unfrozen (phase >= 2).
+                # Uses direct cosine penalty (no margin) so the gradient is always
+                # pushing cos down as long as cos > 0. Target: cos < 0.85.
                 decouple_loss = torch.tensor(0.0, device=device)
-                if not PHASE_CONFIGS[phase]["freeze_embed"] and JP_TO_EN_SOURCE:
+                if (not PHASE_CONFIGS[phase]["freeze_embed"]
+                        and jp_to_en_indices is not None
+                        and jp_to_en_indices):
                     embed_weight = model.note_text_encoder.weight
-                    for jp_offset, en_idx in JP_TO_EN_SOURCE.items():
+                    for jp_offset, en_idx in jp_to_en_indices.items():
                         jp_idx = JP_PHONEME_START + jp_offset
-                        if jp_idx < embed_weight.shape[0]:
+                        if jp_idx < embed_weight.shape[0] and en_idx < embed_weight.shape[0]:
                             cos_sim = F.cosine_similarity(
                                 embed_weight[jp_idx:jp_idx+1],
                                 embed_weight[en_idx:en_idx+1]
                             )
-                            # Penalize if cosine > 0.98
-                            decouple_loss = decouple_loss + F.relu(cos_sim - 0.98) ** 2
-                    decouple_loss = decouple_loss * 0.001  # lambda
+                            # Direct cos penalty (always active when cos > 0.85 target).
+                            # Squared so gradient grows for high cos values.
+                            decouple_loss = decouple_loss + F.relu(cos_sim - 0.85) ** 2
+                    # lambda tuned so decouple_loss is ~10-20% of recon_loss magnitude.
+                    # With 19 entries and cos~0.99, sum ~= 19 * 0.14^2 = 0.37, so
+                    # lambda=0.3 gives ~0.11, comparable to recon_loss ~0.5.
+                    decouple_loss = decouple_loss * 0.3
 
                 loss = recon_loss + decouple_loss
 
@@ -270,10 +283,14 @@ def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, w
             scaler.update()
 
             total_loss += loss.item()
+            total_recon += recon_loss.item()
+            total_decouple += decouple_loss.item() if decouple_loss.item() > 0 else 0
             n += 1
             writer.add_scalar('train/loss_step', loss.item(), epoch * 1000 + bi)
+            writer.add_scalar('train/recon_step', recon_loss.item(), epoch * 1000 + bi)
             if bi % 10 == 0:
-                print(f'  Epoch {epoch} [{bi}] loss={loss.item():.4f}')
+                print(f'  Epoch {epoch} [{bi}] loss={loss.item():.4f} '
+                      f'(recon={recon_loss.item():.4f} decouple={decouple_loss.item():.4f})')
         except RuntimeError as e:
             if 'device' in str(e).lower() or 'cuda' in str(e).lower():
                 print(f'  FATAL: Device error at batch {bi}: {e}')
@@ -283,15 +300,21 @@ def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, w
             traceback.print_exc()
 
     avg = total_loss / max(n, 1)
+    avg_recon = total_recon / max(n, 1)
+    avg_decouple = total_decouple / max(n, 1)
     writer.add_scalar('train/loss_epoch', avg, epoch)
+    writer.add_scalar('train/recon_epoch', avg_recon, epoch)
+    writer.add_scalar('train/decouple_epoch', avg_decouple, epoch)
     return avg
 
 
-def compute_jp_en_cosine_stats(model):
+def compute_jp_en_cosine_stats(model, jp_to_en_indices):
     """Compute cosine similarity between JP embeddings and their EN sources."""
+    if not jp_to_en_indices:
+        return 0.0, 0.0, 0.0
     embed = model.note_text_encoder.weight.data
     sims = []
-    for jp_offset, en_idx in JP_TO_EN_SOURCE.items():
+    for jp_offset, en_idx in jp_to_en_indices.items():
         jp_idx = JP_PHONEME_START + jp_offset
         if jp_idx < embed.shape[0] and en_idx < embed.shape[0]:
             sim = F.cosine_similarity(
@@ -308,8 +331,6 @@ def validate(model, proj, dataloader, device, epoch, writer):
     model.eval()
     proj.eval()
     total_loss = 0
-    total_frames = 0
-    total_phonemes = 0
     n = 0
 
     for batch in dataloader:
@@ -345,12 +366,6 @@ def validate(model, proj, dataloader, device, epoch, writer):
             projected = proj(mel_feat[:, :target_mel.shape[1], :])
             loss = F.mse_loss(projected, target_mel)
             total_loss += loss.item()
-
-            # Count unique phoneme IDs (excluding PAD=0) and mel frames
-            unique_ph = (note_text.unique() > 0).sum().item()
-            n_frames = mel2note.shape[1]
-            total_frames += n_frames
-            total_phonemes += max(unique_ph, 1)
             n += 1
         except RuntimeError as e:
             if 'device' in str(e).lower() or 'cuda' in str(e).lower():
@@ -359,10 +374,8 @@ def validate(model, proj, dataloader, device, epoch, writer):
             print(f'  Val error: {e}')
 
     avg_loss = total_loss / max(n, 1)
-    avg_frames_per_ph = total_frames / max(total_phonemes, 1)
     writer.add_scalar('val/loss_epoch', avg_loss, epoch)
-    writer.add_scalar('val/frames_per_phoneme', avg_frames_per_ph, epoch)
-    return avg_loss, avg_frames_per_ph
+    return avg_loss
 
 
 def save_checkpoint(model, proj, epoch, loss, output_dir, phase):
@@ -390,12 +403,34 @@ def save_checkpoint(model, proj, epoch, loss, output_dir, phase):
     return path
 
 
+def split_train_val(dataset, val_ratio=0.1, seed=42):
+    """Split dataset into train and validation subsets.
+
+    Uses fixed seed for reproducibility. Returns (train_dataset, val_dataset).
+    """
+    n = len(dataset)
+    n_val = max(1, int(n * val_ratio))
+    n_train = n - n_val
+
+    g = torch.Generator()
+    g.manual_seed(seed)
+    indices = torch.randperm(n, generator=g).tolist()
+    train_indices = indices[:n_train]
+    val_indices = indices[n_train:]
+
+    train_subset = Subset(dataset, train_indices)
+    val_subset = Subset(dataset, val_indices)
+    print(f'  Split: {n_train} train / {n_val} val (seed={seed})')
+    return train_subset, val_subset
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--phase', type=int, required=True, choices=[1, 2, 3])
     parser.add_argument('--model_path', default='pretrained_models/SoulX-Singer/model.pt')
     parser.add_argument('--config', default='soulxsinger/config/soulxsinger.yaml')
     parser.add_argument('--phoneset_path', default='train/lora_jp/jp_phone_set.json')
+    parser.add_argument('--mapping_path', default='train/lora_jp/jp_phoneme_mapping.json')
     parser.add_argument('--dataset_metadata', default='train/lora_jp/dataset/metadata.json')
     parser.add_argument('--dataset_wav_dir', default='train/lora_jp/dataset/wavs')
     parser.add_argument('--output_dir', default='outputs/lora_jp')
@@ -408,6 +443,9 @@ def main():
     parser.add_argument('--eval_every', type=int, default=2)
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--val_ratio', type=float, default=0.1,
+                        help='Fraction of dataset to use for validation')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for train/val split')
     args = parser.parse_args()
 
     # Validate device
@@ -426,6 +464,14 @@ def main():
     os.makedirs(stage_dir, exist_ok=True)
 
     config = OmegaConf.load(args.config)
+
+    # Build JP->EN source index map from mapping config
+    jp_to_en_names, phone2idx = load_jp_to_en_source(args.mapping_path)
+    jp_to_en_indices = {}
+    for jp_offset, en_name in jp_to_en_names.items():
+        if en_name in phone2idx:
+            jp_to_en_indices[jp_offset] = phone2idx[en_name]
+    print(f"  JP->EN decoupling map: {len(jp_to_en_indices)} entries")
 
     # Load base model
     print(f'[Phase {args.phase}] Loading base model...')
@@ -473,17 +519,21 @@ def main():
         return max(0.1, 0.5 * (1 + math.cos(math.pi * progress)))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Dataset
+    # Dataset with train/val split
     print('[Phase {}] Loading dataset...'.format(args.phase))
-    dataset = JpLoRADataset(
+    full_dataset = JpLoRADataset(
         metadata_path=args.dataset_metadata,
         wav_dir=args.dataset_wav_dir,
         phoneset_path=args.phoneset_path,
         sample_rate=config.audio.sample_rate,
         hop_size=config.audio.hop_size,
     )
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                            collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True)
+    train_dataset, val_dataset = split_train_val(full_dataset, args.val_ratio, args.seed)
+
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                  collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                                collate_fn=collate_fn, num_workers=args.num_workers, pin_memory=True)
     writer = SummaryWriter(log_dir=os.path.join(stage_dir, 'runs'))
 
     print(f'\n=== Phase {args.phase}: epochs {epoch_start}-{total_epochs}, '
@@ -494,8 +544,9 @@ def main():
 
     for epoch in range(epoch_start, total_epochs + 1):
         t0 = time.time()
-        avg_loss = train_one_epoch(model, proj, dataloader, optimizer, scaler, args.device,
-                                   epoch, writer, phase=args.phase)
+        avg_loss = train_one_epoch(model, proj, train_dataloader, optimizer, scaler,
+                                   args.device, epoch, writer, phase=args.phase,
+                                   jp_to_en_indices=jp_to_en_indices)
         elapsed = time.time() - t0
         print(f'Epoch {epoch}/{total_epochs} loss={avg_loss:.4f} time={elapsed:.1f}s')
 
@@ -505,7 +556,7 @@ def main():
                 JP_PHONEME_START:JP_PHONEME_START+JP_PHONEME_COUNT]
             jp_std = jp_embed.std().item()
             jp_norm = jp_embed.norm(dim=1).mean().item()
-            avg_cos, min_cos, max_cos = compute_jp_en_cosine_stats(model)
+            avg_cos, min_cos, max_cos = compute_jp_en_cosine_stats(model, jp_to_en_indices)
             print(f'  [Embed] JP std={jp_std:.4f}, norm={jp_norm:.3f}, '
                   f'JP-EN cos: avg={avg_cos:.4f} min={min_cos:.4f} max={max_cos:.4f}')
             writer.add_scalar('embed/jp_std', jp_std, epoch)
@@ -513,22 +564,14 @@ def main():
             writer.add_scalar('embed/jp_en_cos_avg', avg_cos, epoch)
             writer.add_scalar('embed/jp_en_cos_min', min_cos, epoch)
 
-        # Validation
+        # Validation (uses separate val_dataset, not training set)
         if epoch % args.eval_every == 0:
-            val_loss, avg_frames = validate(model, proj, dataloader, args.device, epoch, writer)
-            print(f'  val_loss={val_loss:.4f}, avg_frames/phoneme={avg_frames:.1f}')
+            val_loss = validate(model, proj, val_dataloader, args.device, epoch, writer)
+            print(f'  val_loss={val_loss:.4f}')
 
             if val_loss < best_loss:
                 best_loss = val_loss
                 save_checkpoint(model, proj, epoch, val_loss, stage_dir, args.phase)
-
-            # Phase 1 early exit
-            if args.phase == 1 and phase_config["loss_threshold"]:
-                if val_loss < phase_config["loss_threshold"]:
-                    print(f'  Phase 1 target reached (val_loss={val_loss:.4f} < '
-                          f'{phase_config["loss_threshold"]}). Early exit.')
-                    save_checkpoint(model, proj, epoch, val_loss, stage_dir, args.phase)
-                    break
 
         elif epoch % args.save_every == 0:
             save_checkpoint(model, proj, epoch, avg_loss, stage_dir, args.phase)

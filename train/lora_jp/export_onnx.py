@@ -2,8 +2,13 @@
 Export fine-tuned preflow + JP embedding as ONNX for SXSEditor.
 
 Generates ONNX files compatible with the existing inference pipeline:
-- note_text_encoder.onnx: extended embedding (3000 base + 34 JP = 3034 rows)
-- preflow.onnx: fine-tuned preflow with LayerNorm merged in
+- note_text_encoder.onnx: extended embedding (3000 base + 33 JP = 3033 rows)
+- preflow.onnx: fine-tuned preflow blocks (LayerNorm removed for ONNX)
+
+note_pitch_encoder is NOT exported — JP LoRA shares the base model's pitch
+encoder because pitch is a MIDI index (0-127) with no language-specific
+semantic. Exporting a JP-specific pitch_encoder would cause train/inference
+mismatch when switching languages.
 
 Other models (diff_step, vocoder, etc.) are NOT modified.
 
@@ -28,27 +33,21 @@ if sys.platform == 'win32':
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 JP_PHONEME_START = 3000
-JP_PHONEME_COUNT = 34
+JP_PHONEME_COUNT = 33  # jp_pau removed; 33 JP phonemes (jp_a..jp_cl)
 EMBED_DIM = 512
 
 
 class PreflowONNX(nn.Module):
     """Preflow for ONNX export — WITHOUT LayerNorm.
 
-    The fine-tuned blocks are effectively identical to the base model's blocks.
-    The LayerNorm was the main trained component, but removing it gives the
-    correct output range (norm ~28) expected by the diffusion model.
+    SXSEditor inference (preprocessing.js) feeds raw textEmb+pitchEmb+typeEmb
+    directly into preflow without LayerNorm, so the ONNX model must match:
+    no LayerNorm at the input. The 4 ConvNeXtV2Blocks are the trained
+    components that adapt features for the JP distribution.
     """
-    def __init__(self, preflow_state_dict, norm_state_dict=None):
+    def __init__(self, preflow_state_dict):
         super().__init__()
         from soulxsinger.models.modules.convnext import ConvNeXtV2Block
-
-        # Build LayerNorm if norm weights are present
-        if norm_state_dict is not None:
-            self.norm = nn.LayerNorm(EMBED_DIM)
-            self.norm.load_state_dict(norm_state_dict)
-        else:
-            self.norm = None
 
         # Build ConvNeXt blocks
         self.blocks = nn.ModuleList()
@@ -69,8 +68,7 @@ class PreflowONNX(nn.Module):
             self.blocks.append(block)
 
     def forward(self, x):
-        # Skip LayerNorm — blocks are effectively unchanged from base model,
-        # and removing it preserves the output range expected by the diffusion model.
+        # No LayerNorm — matches SXSEditor preprocessing.js inference path
         for block in self.blocks:
             x = block(x)
         return x
@@ -86,22 +84,13 @@ class TextEncoderONNX(nn.Module):
         return self.embedding(input_ids)
 
 
-class PitchEncoderONNX(nn.Module):
-    """Pitch encoder for ONNX export."""
-    def __init__(self, embedding_weight):
-        super().__init__()
-        self.embedding = nn.Embedding.from_pretrained(embedding_weight, freeze=True)
-
-    def forward(self, input_ids):
-        return self.embedding(input_ids)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str, default='outputs/lora_jp/stage3/best.pt')
     parser.add_argument('--base_model', type=str, default='pretrained_models/SoulX-Singer/model.pt')
     parser.add_argument('--output_dir', type=str,
                         default=os.path.join(os.path.dirname(__file__), '..', '..', '..', 'onnx_models', 'fp16', 'JP'))
+    parser.add_argument('--opset', type=int, default=17, help='ONNX opset version')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -121,7 +110,7 @@ def main():
 
     # Build full embedding: base rows from base model, JP rows from fine-tuned
     if 'embed_state_dict' in ft_ckpt:
-        ft_embedding = ft_ckpt['embed_state_dict']['weight']  # [3034, 512]
+        ft_embedding = ft_ckpt['embed_state_dict']['weight']  # [3033, 512]
         print(f'  Fine-tuned embedding: {ft_embedding.shape}')
     else:
         ft_embedding = base_embedding
@@ -141,7 +130,7 @@ def main():
         text_model, (dummy_ids,), text_path,
         input_names=['input_ids'], output_names=['embeddings'],
         dynamic_axes={'input_ids': {1: 'seq'}, 'embeddings': {1: 'seq'}},
-        opset_version=17,
+        opset_version=args.opset,
         dynamo=False,
     )
     text_size = os.path.getsize(text_path)
@@ -149,15 +138,11 @@ def main():
     data_size = os.path.getsize(data_path) if os.path.exists(data_path) else 0
     print(f'  {text_path}: {(text_size + data_size) / 1024 / 1024:.2f} MB')
 
-    # Export FP16 preflow (with LayerNorm merged)
+    # Export FP16 preflow (no LayerNorm — matches SXSEditor inference)
     print('\nExporting FP16 preflow.onnx...')
     pf_sd = ft_ckpt.get('preflow_state_dict', {})
-    norm_sd = ft_ckpt.get('preflow_norm_state_dict', None)
 
-    preflow_model = PreflowONNX(
-        {k: v.half() for k, v in pf_sd.items()},
-        {k: v.half() for k, v in norm_sd.items()} if norm_sd else None
-    )
+    preflow_model = PreflowONNX({k: v.half() for k, v in pf_sd.items()})
     preflow_model.half()
     preflow_model.eval()
     dummy_feat = torch.randn(1, 100, EMBED_DIM).half()
@@ -166,7 +151,7 @@ def main():
         preflow_model, (dummy_feat,), pf_path,
         input_names=['features'], output_names=['processed_features'],
         dynamic_axes={'features': {1: 'seq'}, 'processed_features': {1: 'seq'}},
-        opset_version=17,
+        opset_version=args.opset,
         dynamo=False,
     )
     pf_size = os.path.getsize(pf_path)
@@ -174,37 +159,24 @@ def main():
     pf_data_size = os.path.getsize(pf_data_path) if os.path.exists(pf_data_path) else 0
     print(f'  {pf_path}: {(pf_size + pf_data_size) / 1024 / 1024:.2f} MB')
 
-    # Export FP16 pitch encoder
-    print('\nExporting FP16 note_pitch_encoder.onnx...')
-    if 'pitch_encoder_state_dict' in ft_ckpt:
-        pe_weight = ft_ckpt['pitch_encoder_state_dict']['weight'].half()
-    else:
-        pe_weight = base_sd['note_pitch_encoder.weight'].clone().half()
-    pitch_model = PitchEncoderONNX(pe_weight)
-    pitch_model.eval()
-    dummy_pitch_ids = torch.randint(0, 256, (1, 10), dtype=torch.long)
-    pe_path = os.path.join(args.output_dir, 'note_pitch_encoder.onnx')
-    torch.onnx.export(
-        pitch_model, (dummy_pitch_ids,), pe_path,
-        input_names=['input_ids'], output_names=['embeddings'],
-        dynamic_axes={'input_ids': {1: 'seq'}, 'embeddings': {1: 'seq'}},
-        opset_version=17,
-        dynamo=False,
-    )
-    pe_size = os.path.getsize(pe_path)
-    pe_data_path = pe_path + '.data'
-    pe_data_size = os.path.getsize(pe_data_path) if os.path.exists(pe_data_path) else 0
-    print(f'  {pe_path}: {(pe_size + pe_data_size) / 1024 / 1024:.2f} MB')
+    # NOTE: note_pitch_encoder is intentionally NOT exported.
+    # JP LoRA shares the base model's pitch encoder because:
+    # 1. note_pitch is a MIDI index (0-127) with no language-specific semantic
+    # 2. SXSEditor's JP_MODEL_FILES only requires note_text_encoder + preflow
+    # 3. Exporting a JP-specific pitch_encoder would cause the encoder to be
+    #    hot-swapped on language switch, but pitch semantics are identical,
+    #    so the swap is unnecessary and risks train/inference mismatch.
+    print('\nSkipping note_pitch_encoder export (shared with base model).')
 
     # Verify ONNX models
     print('\nVerifying ONNX models...')
     import onnxruntime as ort
-    for fname in ['note_text_encoder.onnx', 'preflow.onnx', 'note_pitch_encoder.onnx']:
+    for fname in ['note_text_encoder.onnx', 'preflow.onnx']:
         fpath = os.path.join(args.output_dir, fname)
         sess = ort.InferenceSession(fpath, providers=['CPUExecutionProvider'])
         inp = sess.get_inputs()[0]
         if 'input_ids' in inp.name:
-            max_id = 3034 if 'text_encoder' in fname else 256
+            max_id = full_embedding.shape[0]
             test = torch.randint(0, max_id, (1, 5), dtype=torch.long).numpy()
         else:
             test = torch.randn(1, 20, EMBED_DIM).numpy().astype('float16')
@@ -225,9 +197,15 @@ def main():
     else:
         print('  JP embeddings look good.')
 
+    # Verify <SP> embedding is the base model's value (since pau now maps to <SP>)
+    sp_id = 1
+    sp_out = sess.run(None, {'input_ids': torch.tensor([[sp_id]], dtype=torch.long).numpy()})[0]
+    print(f'\n  <SP> (ID={sp_id}) embedding: mean={sp_out.mean():.6f}, std={sp_out.std():.6f}')
+
     print(f'\nExport complete. Files in: {args.output_dir}')
-    print('Exported: note_text_encoder, preflow, note_pitch_encoder.')
-    print('Other models (diff_step, vocoder, etc.) are used as-is.')
+    print('Exported: note_text_encoder, preflow.')
+    print('Skipped: note_pitch_encoder (shared with base model).')
+    print('Other models (diff_step, vocoder, etc.) are used as-is from base.')
 
 
 if __name__ == '__main__':

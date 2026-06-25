@@ -31,8 +31,11 @@ except ImportError:
 
 
 # Phoneme mapping: lab phoneme -> jp_* prefixed phoneme
+# NOTE: pau now maps to <SP> (ID=1) to align with SXSEditor inference,
+# which uses <SP> for all pauses. This avoids training a jp_pau embedding
+# that would never be queried at inference time.
 PHONEME_MAP = {
-    'pau': 'jp_pau',
+    'pau': '<SP>',
     'a': 'jp_a',
     'i': 'jp_i',
     'u': 'jp_u',
@@ -70,7 +73,7 @@ PHONEME_MAP = {
     'N': 'jp_n',
     'O': 'jp_o',
     'U': 'jp_u',
-    'xx': 'jp_pau',  # unknown -> pause
+    'xx': '<SP>',   # unknown -> pause (use <SP> to align with inference)
 }
 
 # Consonants (for note_type determination)
@@ -194,18 +197,42 @@ def lab_phonemes_to_notes(
 
     For each MIDI note, include all matching phonemes (consonant + vowel).
     Consonants get a short duration, vowels get the remaining duration.
+    Inserts <SP> notes between non-adjacent MIDI notes to align with
+    SXSEditor inference (which auto-inserts SP for gaps).
     Returns: (phonemes, durations, note_pitches, note_types)
+
+    note_type values (must match SXSEditor preprocessing.js):
+      1 = SP (short pause / rest)
+      2 = normal note
+      3 = slur (continuation of previous note's vowel)
     """
     phonemes = []
     durations = []
     note_pitches = []
     note_types = []
 
-    for note in midi_notes:
+    # Minimum duration: 3 mel frames to prevent DataProcessor overlap bug.
+    # preprocess() expands each phoneme to BOW+phoneme+EOW (3 tokens).
+    # With only 2 frames, BOW+EOW consume all frames and the actual
+    # phoneme gets 0 frames, causing it to be skipped in mel2note.
+    min_dur = 3 * hop_size / sample_rate
+
+    prev_note_end = None
+    for ni, note in enumerate(midi_notes):
         note_start = note['start']
         note_end = note['end']
         note_pitch = note['pitch']
         note_duration = note_end - note_start
+
+        # Insert SP note for gap between previous note and this note
+        # (matches SXSEditor midiParser.js auto-SP insertion logic)
+        if prev_note_end is not None and note_start > prev_note_end + 0.05:
+            gap_dur = note_start - prev_note_end
+            phonemes.append('<SP>')
+            durations.append(max(gap_dur, min_dur))
+            note_pitches.append(0)  # SP notes use pitch=0
+            note_types.append(1)    # SP
+        prev_note_end = note_end
 
         # Find lab phonemes within this note's time range
         matching_phonemes = []
@@ -243,8 +270,10 @@ def lab_phonemes_to_notes(
             jp_ph = PHONEME_MAP.get(raw_ph, f'jp_{raw_ph}')
             phonemes.append(jp_ph)
             durations.append(note_duration)
-            note_pitches.append(note_pitch)
-            note_types.append(2 if raw_ph != 'pau' else 1)  # normal note or SP
+            # pau maps to <SP> -> type=1; others -> type=2
+            is_pause = (jp_ph == '<SP>')
+            note_pitches.append(0 if is_pause else note_pitch)
+            note_types.append(1 if is_pause else 2)
             continue
 
         # Total consonant and vowel durations from lab timing
@@ -258,11 +287,12 @@ def lab_phonemes_to_notes(
         else:
             scale = 1.0
 
-        # Minimum duration: 3 mel frames to prevent DataProcessor overlap bug.
-        # preprocess() expands each phoneme to BOW+phoneme+EOW (3 tokens).
-        # With only 2 frames, BOW+EOW consume all frames and the actual
-        # phoneme gets 0 frames, causing it to be skipped in mel2note.
-        min_dur = 3 * hop_size / sample_rate
+        # Determine note_type: slur if this note shares a syllable with
+        # the previous note (i.e., consonants empty, only vowels, and
+        # previous note ended exactly where this one starts).
+        is_slur = (len(consonants) == 0
+                   and ni > 0
+                   and midi_notes[ni-1]['end'] >= note_start - 0.01)
 
         # Add consonant phonemes (each gets its proportional lab duration)
         for c in consonants:
@@ -276,7 +306,9 @@ def lab_phonemes_to_notes(
             phonemes.append(v['ph'])
             durations.append(max(v['dur'] * scale, min_dur))
             note_pitches.append(note_pitch)
-            note_types.append(2)  # vowel = normal note (type 2)
+            # First vowel after consonants: slur (3) if applicable, else normal (2)
+            # Subsequent vowels within same note: slur (3) — they're continuations
+            note_types.append(3 if is_slur else 2)
 
     return phonemes, durations, note_pitches, note_types
 

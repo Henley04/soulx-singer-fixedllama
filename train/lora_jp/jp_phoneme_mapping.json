@@ -1,12 +1,4 @@
 {
-  "jp_pau": {
-    "strategy": "pause_mean",
-    "pause_sources": [
-      "<SP>",
-      "<AP>"
-    ],
-    "noise_std": 0.01
-  },
   "jp_cl": {
     "strategy": "pause_mean",
     "pause_sources": [
