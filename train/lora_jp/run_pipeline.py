@@ -86,7 +86,7 @@ def main():
          "--dataset_wav_dir", WAV_DIR,
          "--output_dir", OUTPUT_DIR,
          "--init_embed", f"{OUTPUT_DIR}/init_embed.pt",
-         "--batch_size", "2",
+         "--batch_size", "1",
          "--lr", "5e-5",
          "--device", "cuda"]
     )
@@ -118,7 +118,7 @@ def main():
          "--dataset_wav_dir", WAV_DIR,
          "--output_dir", OUTPUT_DIR,
          "--resume", f"{OUTPUT_DIR}/stage1/best.pt",
-         "--batch_size", "2",
+         "--batch_size", "1",
          "--lr", "5e-5",
          "--device", "cuda"]
     )
@@ -150,7 +150,7 @@ def main():
          "--dataset_wav_dir", WAV_DIR,
          "--output_dir", OUTPUT_DIR,
          "--resume", f"{OUTPUT_DIR}/stage2/best.pt",
-         "--batch_size", "2",
+         "--batch_size", "1",
          "--lr", "5e-5",
          "--device", "cuda"]
     )

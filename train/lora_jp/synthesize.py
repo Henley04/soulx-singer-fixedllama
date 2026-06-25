@@ -135,6 +135,15 @@ def load_fine_tuned_model(model_path, checkpoint_path, config_path, device='cuda
             else:
                 model.note_text_encoder.weight.data[:ft_weight.shape[0]] = ft_weight
             print(f"  embedding: loaded (shape={model.note_text_encoder.weight.shape})")
+
+        # Restore cond_emb (Linear inside cfm_decoder that projects decoder_inp
+        # to diff_estimator hidden size). Trained with flow-matching loss.
+        if 'cond_emb_state_dict' in ft_ckpt:
+            model.cfm_decoder.model.cond_emb.load_state_dict(
+                ft_ckpt['cond_emb_state_dict'])
+            print("  cond_emb: loaded")
+        else:
+            print("  cond_emb: NOT in checkpoint (old checkpoint), using base")
     else:
         print("  No JP checkpoint, using base model only")
 

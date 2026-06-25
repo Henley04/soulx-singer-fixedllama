@@ -6,6 +6,11 @@ Three-phase training:
   Phase 2 (Embed FT): Unfreeze embedding with lower LR (to epoch 40)
   Phase 3 (Joint): Full fine-tune with duration monitoring (to epoch 80)
 
+The training objective is the actual cfm_decoder flow-matching loss (the same
+objective used at inference time via `reverse_diffusion`), NOT a proxy
+MelProjection MSE loss. This keeps the training objective aligned with
+inference and is the root-cause fix for unintelligible Japanese pronunciation.
+
 Usage:
     # Phase 1
     python train/lora_jp/train_staged.py --phase 1 \
@@ -45,9 +50,9 @@ EMBED_DIM = 512
 
 # Phase configs
 PHASE_CONFIGS = {
-    1: {"epochs": 15, "freeze_embed": True,  "embed_lr_ratio": 0.0,  "loss_threshold": None},
-    2: {"epochs": 40, "freeze_embed": False, "embed_lr_ratio": 0.2,  "loss_threshold": None},
-    3: {"epochs": 80, "freeze_embed": False, "embed_lr_ratio": 0.2,  "loss_threshold": None},
+    1: {"epochs": 15, "freeze_embed": True,  "embed_lr_ratio": 0.0, "loss_threshold": None},
+    2: {"epochs": 40, "freeze_embed": False, "embed_lr_ratio": 0.2, "loss_threshold": None},
+    3: {"epochs": 80, "freeze_embed": False, "embed_lr_ratio": 0.2, "loss_threshold": None},
 }
 
 
@@ -86,16 +91,6 @@ def load_jp_to_en_source(mapping_path):
             if src_phone in phone2idx:
                 jp_to_en[jp_offset] = src_phone
     return jp_to_en, phone2idx
-
-
-class MelProjection(nn.Module):
-    """Project encoder features (512) to mel space (128) for loss computation."""
-    def __init__(self, enc_dim=EMBED_DIM, mel_dim=128):
-        super().__init__()
-        self.proj = nn.Linear(enc_dim, mel_dim)
-
-    def forward(self, x):
-        return self.proj(x)
 
 
 def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_path=None):
@@ -142,15 +137,30 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_pa
             pe_weight = ckpt['pitch_encoder_state_dict']['weight']
             model.note_pitch_encoder.weight.data[:pe_weight.shape[0]] = pe_weight
 
+        # Restore cond_emb (Linear(512, 1024) inside cfm_decoder that projects
+        # decoder_inp features to the diff_estimator hidden size).
+        # Note: old checkpoints produced by the MelProjection variant do not
+        # contain this key; that's fine — we just skip restoration.
+        if 'cond_emb_state_dict' in ckpt:
+            model.cfm_decoder.model.cond_emb.load_state_dict(
+                ckpt['cond_emb_state_dict'])
+            print("  Restored cond_emb from checkpoint")
+
         ckpt_info["epoch_start"] = ckpt.get("epoch", 0) + 1
         ckpt_info["prev_loss"] = ckpt.get("loss", float('inf'))
 
-    # Configure freeze state
+    # Configure freeze state — freeze everything first, then selectively unfreeze.
     for param in model.parameters():
         param.requires_grad = False
 
     # Unfreeze preflow
     for param in model.preflow.parameters():
+        param.requires_grad = True
+
+    # Unfreeze cond_emb (Linear(512, 1024) inside cfm_decoder). This is the
+    # only trainable part of the cfm_decoder; it projects decoder_inp features
+    # to the diff_estimator hidden size, so adapting it for JP is critical.
+    for param in model.cfm_decoder.model.cond_emb.parameters():
         param.requires_grad = True
 
     # pitch_encoder is ALWAYS frozen — pitch is a MIDI index with no
@@ -161,6 +171,11 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_pa
     # representation and (b) be discarded at ONNX export time anyway.
     # See: export_onnx.py does NOT export note_pitch_encoder.
     print("  Pitch encoder: FROZEN (shared with base model)")
+
+    # cfm_decoder diff_estimator (22-layer DiffLlama) is FROZEN. Gradients
+    # flow THROUGH it to reach preflow + embedding + cond_emb.
+    print("  cfm_decoder.diff_estimator: FROZEN")
+    print("  cfm_decoder.cond_emb: UNFROZEN")
 
     # Unfreeze embedding if not frozen
     if not config["freeze_embed"]:
@@ -176,17 +191,18 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_pa
     return model, ckpt_info
 
 
-def build_optimizer(model, proj, phase, base_lr):
+def build_optimizer(model, phase, base_lr):
     """Build optimizer with per-group learning rates for the given phase.
 
     pitch_encoder is intentionally excluded — it's always frozen (see
-    setup_phase). Only preflow, projection, and (when unfrozen) text
-    encoder embedding are trained.
+    setup_phase). Only preflow, cfm_decoder.cond_emb, and (when unfrozen)
+    text encoder embedding are trained. The diff_estimator stays frozen but
+    is still part of the forward graph so gradients reach cond_emb.
     """
     config = PHASE_CONFIGS[phase]
     param_groups = [
         {'params': model.preflow.parameters(), 'lr': base_lr},
-        {'params': proj.parameters(), 'lr': base_lr},
+        {'params': model.cfm_decoder.model.cond_emb.parameters(), 'lr': base_lr},
     ]
     if not config["freeze_embed"]:
         embed_lr = base_lr * config["embed_lr_ratio"]
@@ -194,16 +210,17 @@ def build_optimizer(model, proj, phase, base_lr):
             'params': model.note_text_encoder.parameters(),
             'lr': embed_lr
         })
-        print(f"  Optimizer: preflow lr={base_lr}, embed lr={embed_lr}")
+        print(f"  Optimizer: preflow+cond_emb lr={base_lr}, embed lr={embed_lr}")
+    else:
+        print(f"  Optimizer: preflow+cond_emb lr={base_lr}")
 
     optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
     return optimizer
 
 
-def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, writer,
+def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, writer,
                     phase=1, use_amp=True, jp_to_en_indices=None):
     model.train()
-    proj.train()
     total_loss = 0
     total_recon = 0
     total_decouple = 0
@@ -213,6 +230,11 @@ def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, w
     for bi, batch in enumerate(dataloader):
         if batch is None:
             continue
+        # Skip batches without waveform — flow-matching loss requires a target mel.
+        waveform = batch.get('waveform')
+        if waveform is None:
+            continue
+
         optimizer.zero_grad()
         try:
             with torch.amp.autocast('cuda', enabled=use_cuda_amp):
@@ -220,12 +242,11 @@ def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, w
                 note_pitch = batch['note_pitch'].to(device)
                 note_type = batch['note_type'].to(device)
                 mel2note = batch['mel2note'].to(device)
+                mel_lens = batch['mel_len'].to(device)  # (B,)
                 f0 = batch.get('f0')
                 if f0 is not None:
                     f0 = f0.to(device)
-                waveform = batch.get('waveform')
-                if waveform is not None:
-                    waveform = waveform.to(device)
+                waveform = waveform.to(device)
 
                 features = (model.note_text_encoder(note_text) +
                             model.note_pitch_encoder(note_pitch) +
@@ -238,14 +259,28 @@ def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, w
                     f0_enc = model.f0_encoder(f0_coarse)
                     mel_feat = mel_feat + f0_enc[:, :mel_feat.shape[1], :]
 
-                if waveform is not None:
-                    target_mel = model.mel(waveform.float())
-                    target_mel = target_mel[:, :mel_feat.shape[1], :]
-                else:
-                    target_mel = torch.zeros(mel_feat.shape[0], mel_feat.shape[1], 128, device=device)
+                # Target mel from waveform (normalized: (x - mean) / sqrt(var))
+                target_mel = model.mel(waveform.float())  # (B, T_mel, 128)
 
-                projected = proj(mel_feat[:, :target_mel.shape[1], :])
-                recon_loss = F.mse_loss(projected, target_mel)
+                # Align lengths between target_mel and mel_feat
+                T = min(target_mel.shape[1], mel_feat.shape[1])
+                target_mel = target_mel[:, :T, :]
+                mel_feat = mel_feat[:, :T, :]
+
+                # Build x_mask from mel_lens: 1 for valid frames, 0 for padding.
+                x_mask = (torch.arange(T, device=device).unsqueeze(0)
+                          < mel_lens.unsqueeze(1).clamp(max=T)).float()  # (B, T)
+
+                # Flow-matching loss via cfm_decoder forward. is_prompt=None
+                # triggers random prompt-length sampling (with 20% CFG drop),
+                # which is correct for few-shot diffusion training.
+                noise, x, flow_pred, final_mask, prompt_len = model.cfm_decoder(
+                    target_mel, x_mask, mel_feat, is_prompt=None)
+
+                sigma = model.cfm_decoder.model.sigma
+                flow_target = x - (1 - sigma) * noise
+                recon_loss = ((flow_pred - flow_target) ** 2 * final_mask).sum() \
+                             / final_mask.sum().clamp(min=1)
 
                 # Decoupling loss: prevent JP embeddings from collapsing onto EN sources.
                 # Only applies when embeddings are unfrozen (phase >= 2).
@@ -276,7 +311,7 @@ def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, w
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad] + list(proj.parameters()),
+                [p for p in model.parameters() if p.requires_grad],
                 max_norm=1.0
             )
             scaler.step(optimizer)
@@ -290,7 +325,7 @@ def train_one_epoch(model, proj, dataloader, optimizer, scaler, device, epoch, w
             writer.add_scalar('train/recon_step', recon_loss.item(), epoch * 1000 + bi)
             if bi % 10 == 0:
                 print(f'  Epoch {epoch} [{bi}] loss={loss.item():.4f} '
-                      f'(recon={recon_loss.item():.4f} decouple={decouple_loss.item():.4f})')
+                      f'(flow={recon_loss.item():.4f} decouple={decouple_loss.item():.4f})')
         except RuntimeError as e:
             if 'device' in str(e).lower() or 'cuda' in str(e).lower():
                 print(f'  FATAL: Device error at batch {bi}: {e}')
@@ -327,26 +362,28 @@ def compute_jp_en_cosine_stats(model, jp_to_en_indices):
 
 
 @torch.no_grad()
-def validate(model, proj, dataloader, device, epoch, writer):
+def validate(model, dataloader, device, epoch, writer):
     model.eval()
-    proj.eval()
     total_loss = 0
     n = 0
 
     for batch in dataloader:
         if batch is None:
             continue
+        # Skip batches without waveform — flow-matching loss requires a target mel.
+        waveform = batch.get('waveform')
+        if waveform is None:
+            continue
         try:
             note_text = batch['phoneme'].to(device)
             note_pitch = batch['note_pitch'].to(device)
             note_type = batch['note_type'].to(device)
             mel2note = batch['mel2note'].to(device)
+            mel_lens = batch['mel_len'].to(device)  # (B,)
             f0 = batch.get('f0')
             if f0 is not None:
                 f0 = f0.to(device)
-            waveform = batch.get('waveform')
-            if waveform is not None:
-                waveform = waveform.to(device)
+            waveform = waveform.to(device)
 
             features = (model.note_text_encoder(note_text) +
                         model.note_pitch_encoder(note_pitch) +
@@ -358,13 +395,22 @@ def validate(model, proj, dataloader, device, epoch, writer):
                 f0_coarse = model.f0_to_coarse(f0)
                 mel_feat = mel_feat + model.f0_encoder(f0_coarse)[:, :mel_feat.shape[1], :]
 
-            if waveform is not None:
-                target_mel = model.mel(waveform.float())[:, :mel_feat.shape[1], :]
-            else:
-                target_mel = torch.zeros(mel_feat.shape[0], mel_feat.shape[1], 128, device=device)
+            target_mel = model.mel(waveform.float())  # (B, T_mel, 128)
 
-            projected = proj(mel_feat[:, :target_mel.shape[1], :])
-            loss = F.mse_loss(projected, target_mel)
+            T = min(target_mel.shape[1], mel_feat.shape[1])
+            target_mel = target_mel[:, :T, :]
+            mel_feat = mel_feat[:, :T, :]
+
+            x_mask = (torch.arange(T, device=device).unsqueeze(0)
+                      < mel_lens.unsqueeze(1).clamp(max=T)).float()  # (B, T)
+
+            noise, x, flow_pred, final_mask, prompt_len = model.cfm_decoder(
+                target_mel, x_mask, mel_feat, is_prompt=None)
+
+            sigma = model.cfm_decoder.model.sigma
+            flow_target = x - (1 - sigma) * noise
+            loss = ((flow_pred - flow_target) ** 2 * final_mask).sum() \
+                   / final_mask.sum().clamp(min=1)
             total_loss += loss.item()
             n += 1
         except RuntimeError as e:
@@ -378,7 +424,7 @@ def validate(model, proj, dataloader, device, epoch, writer):
     return avg_loss
 
 
-def save_checkpoint(model, proj, epoch, loss, output_dir, phase):
+def save_checkpoint(model, epoch, loss, output_dir, phase):
     os.makedirs(output_dir, exist_ok=True)
     embed_weight = model.note_text_encoder.weight.data.clone()
 
@@ -390,7 +436,7 @@ def save_checkpoint(model, proj, epoch, loss, output_dir, phase):
         'embed_state_dict': {'weight': embed_weight},
         'pitch_encoder_state_dict': {'weight': model.note_pitch_encoder.weight.data.clone()},
         'jp_embed': embed_weight[JP_PHONEME_START:JP_PHONEME_START+JP_PHONEME_COUNT].clone(),
-        'proj_state_dict': proj.state_dict(),
+        'cond_emb_state_dict': model.cfm_decoder.model.cond_emb.state_dict(),
     }
 
     path = os.path.join(output_dir, f'epoch{epoch:03d}.pt')
@@ -436,7 +482,7 @@ def main():
     parser.add_argument('--output_dir', default='outputs/lora_jp')
     parser.add_argument('--init_embed', default=None, help='Path to init_embed.pt for Phase 1')
     parser.add_argument('--resume', default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--batch_size', type=int, default=2)
+    parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--epochs', type=int, default=None, help='Override phase epoch count')
     parser.add_argument('--save_every', type=int, default=5)
@@ -479,31 +525,26 @@ def main():
     ckpt = torch.load(args.model_path, map_location='cpu', weights_only=False)
     model.load_state_dict(ckpt.get('state_dict', ckpt), strict=True)
 
-    # Setup phase
+    # Setup phase (also handles resume, including cond_emb restoration).
+    # setup_phase freezes everything, then unfreezes preflow + cond_emb
+    # (and optionally the text encoder embedding). The cfm_decoder
+    # diff_estimator stays FROZEN — gradients flow through it to reach
+    # preflow + embedding + cond_emb.
     print(f'[Phase {args.phase}] Setting up...')
     model, ckpt_info = setup_phase(model, args.phase, args.init_embed, args.resume)
     epoch_start = ckpt_info.get("epoch_start", 1)
 
-    # Freeze unused components to save VRAM (cfm_decoder + vocoder are not used in training)
-    for param in model.cfm_decoder.parameters():
-        param.requires_grad = False
+    # vocoder is never used in training — keep it frozen to save VRAM.
+    # (cfm_decoder freezing is already handled by setup_phase, which leaves
+    # cond_emb trainable and diff_estimator frozen.)
     for param in model.vocoder.parameters():
         param.requires_grad = False
 
     # Move model to device BEFORE building optimizer
     model = model.to(args.device)
 
-    # Projection head
-    proj = MelProjection().to(args.device)
-
-    # Restore proj if resuming
-    if args.resume:
-        resume_ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
-        if 'proj_state_dict' in resume_ckpt:
-            proj.load_state_dict(resume_ckpt['proj_state_dict'])
-
     # Optimizer (after model is on device, so optimizer states are on GPU from the start)
-    optimizer = build_optimizer(model, proj, args.phase, args.lr)
+    optimizer = build_optimizer(model, args.phase, args.lr)
 
     # GradScaler for AMP (persists across epochs to adapt scale factor)
     use_cuda_amp = args.device.startswith('cuda')
@@ -544,7 +585,7 @@ def main():
 
     for epoch in range(epoch_start, total_epochs + 1):
         t0 = time.time()
-        avg_loss = train_one_epoch(model, proj, train_dataloader, optimizer, scaler,
+        avg_loss = train_one_epoch(model, train_dataloader, optimizer, scaler,
                                    args.device, epoch, writer, phase=args.phase,
                                    jp_to_en_indices=jp_to_en_indices)
         elapsed = time.time() - t0
@@ -566,15 +607,15 @@ def main():
 
         # Validation (uses separate val_dataset, not training set)
         if epoch % args.eval_every == 0:
-            val_loss = validate(model, proj, val_dataloader, args.device, epoch, writer)
+            val_loss = validate(model, val_dataloader, args.device, epoch, writer)
             print(f'  val_loss={val_loss:.4f}')
 
             if val_loss < best_loss:
                 best_loss = val_loss
-                save_checkpoint(model, proj, epoch, val_loss, stage_dir, args.phase)
+                save_checkpoint(model, epoch, val_loss, stage_dir, args.phase)
 
         elif epoch % args.save_every == 0:
-            save_checkpoint(model, proj, epoch, avg_loss, stage_dir, args.phase)
+            save_checkpoint(model, epoch, avg_loss, stage_dir, args.phase)
 
         scheduler.step()
 

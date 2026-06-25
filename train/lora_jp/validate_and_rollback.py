@@ -30,7 +30,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from soulxsinger.models.soulxsinger import SoulXSinger
 from train.lora_jp.dataset import JpLoRADataset, collate_fn
-from train.lora_jp.train_staged import MelProjection
 
 JP_PHONEME_START = 3000
 JP_PHONEME_COUNT = 33  # jp_pau removed; 33 JP phonemes
@@ -119,10 +118,9 @@ def compute_embedding_stats(checkpoint, jp_to_en=None):
 
 
 @torch.no_grad()
-def compute_val_metrics(model, proj, dataloader, device):
-    """Compute validation loss and avg frames per phoneme."""
+def compute_val_metrics(model, dataloader, device):
+    """Compute validation flow-matching loss and avg frames per phoneme."""
     model.eval()
-    proj.eval()
     total_loss = 0
     total_frames = 0
     total_phonemes = 0
@@ -131,17 +129,19 @@ def compute_val_metrics(model, proj, dataloader, device):
     for batch in dataloader:
         if batch is None:
             continue
+        waveform = batch.get('waveform')
+        if waveform is None:
+            continue
         try:
             note_text = batch['phoneme'].to(device)
             note_pitch = batch['note_pitch'].to(device)
             note_type = batch['note_type'].to(device)
             mel2note = batch['mel2note'].to(device)
+            mel_lens = batch['mel_len'].to(device)
             f0 = batch.get('f0')
             if f0 is not None:
                 f0 = f0.to(device)
-            waveform = batch.get('waveform')
-            if waveform is not None:
-                waveform = waveform.to(device)
+            waveform = waveform.to(device)
 
             features = (model.note_text_encoder(note_text) +
                         model.note_pitch_encoder(note_pitch) +
@@ -153,13 +153,21 @@ def compute_val_metrics(model, proj, dataloader, device):
                 f0_coarse = model.f0_to_coarse(f0)
                 mel_feat = mel_feat + model.f0_encoder(f0_coarse)[:, :mel_feat.shape[1], :]
 
-            if waveform is not None:
-                target_mel = model.mel(waveform.float())[:, :mel_feat.shape[1], :]
-            else:
-                target_mel = torch.zeros(mel_feat.shape[0], mel_feat.shape[1], 128, device=device)
+            target_mel = model.mel(waveform.float())
+            T = min(target_mel.shape[1], mel_feat.shape[1])
+            target_mel = target_mel[:, :T, :]
+            mel_feat = mel_feat[:, :T, :]
 
-            projected = proj(mel_feat[:, :target_mel.shape[1], :])
-            loss = F.mse_loss(projected, target_mel)
+            x_mask = (torch.arange(T, device=device).unsqueeze(0)
+                      < mel_lens.unsqueeze(1).clamp(max=T)).float()
+
+            noise, x, flow_pred, final_mask, prompt_len = model.cfm_decoder(
+                target_mel, x_mask, mel_feat, is_prompt=None)
+
+            sigma = model.cfm_decoder.model.sigma
+            flow_target = x - (1 - sigma) * noise
+            loss = ((flow_pred - flow_target) ** 2 * final_mask).sum() \
+                   / final_mask.sum().clamp(min=1)
             total_loss += loss.item()
 
             # Use unique non-PAD phoneme IDs for meaningful ratio
@@ -218,9 +226,10 @@ def evaluate_checkpoint(checkpoint_path, model_path, config_path, dataset_metada
         pe_weight = ckpt['pitch_encoder_state_dict']['weight']
         model.note_pitch_encoder.weight.data[:pe_weight.shape[0]] = pe_weight
 
-    proj = MelProjection().to(device)
-    if 'proj_state_dict' in ckpt:
-        proj.load_state_dict(ckpt['proj_state_dict'])
+    # Restore cond_emb (trained with flow-matching loss)
+    if 'cond_emb_state_dict' in ckpt:
+        model.cfm_decoder.model.cond_emb.load_state_dict(
+            ckpt['cond_emb_state_dict'])
 
     model = model.to(device)
 
@@ -243,10 +252,10 @@ def evaluate_checkpoint(checkpoint_path, model_path, config_path, dataset_metada
         hop_size=config.audio.hop_size,
     )
     _, val_dataset = split_train_val(full_dataset, val_ratio=0.1, seed=42)
-    dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False,
+    dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False,
                             collate_fn=collate_fn, num_workers=0)
 
-    val_loss, avg_frames = compute_val_metrics(model, proj, dataloader, device)
+    val_loss, avg_frames = compute_val_metrics(model, dataloader, device)
 
     return {
         "checkpoint": checkpoint_path,

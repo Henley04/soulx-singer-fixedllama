@@ -148,6 +148,11 @@ class JpLoRADataset(Dataset):
                 if 'waveform' in item:
                     item['waveform'] = item['waveform'][:, :self.max_frames * self.hop_size]
 
+            # Track actual mel length for x_mask construction in training.
+            # This is critical for flow-matching loss: padding frames must be
+            # masked out (x_mask=0) so the cfm_decoder doesn't learn from them.
+            item['mel_len'] = torch.tensor([item['mel2note'].shape[1]], dtype=torch.long)
+
             return item
 
         except Exception as e:
