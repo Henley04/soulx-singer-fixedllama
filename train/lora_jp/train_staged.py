@@ -52,7 +52,7 @@ EMBED_DIM = 512
 PHASE_CONFIGS = {
     1: {"epochs": 15, "freeze_embed": True,  "embed_lr_ratio": 0.0, "loss_threshold": None},
     2: {"epochs": 40, "freeze_embed": False, "embed_lr_ratio": 0.2, "loss_threshold": None},
-    3: {"epochs": 80, "freeze_embed": False, "embed_lr_ratio": 0.5, "loss_threshold": None},
+    3: {"epochs": 80, "freeze_embed": False, "embed_lr_ratio": 1.0, "loss_threshold": None},
 }
 
 
@@ -301,12 +301,14 @@ def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, writer,
                             # Direct cos penalty (always active when cos > 0.85 target).
                             # Squared so gradient grows for high cos values.
                             decouple_loss = decouple_loss + F.relu(cos_sim - 0.85) ** 2
-                    # lambda tuned so decouple_loss is ~10-20% of recon_loss magnitude.
+                    # lambda tuned so decouple_loss provides meaningful gradient.
                     # With 19 entries and cos~0.99, sum ~= 19 * 0.14^2 = 0.37.
-                    # Flow-matching loss is ~30 (vs old MelProjection MSE ~0.5),
-                    # so lambda needs to be 60x larger: 0.3 * 60 = 18.
-                    # Using 15 conservatively: 0.37 * 15 = 5.55 / 30 = 18.5%.
-                    decouple_loss = decouple_loss * 15.0
+                    # Flow-matching gradient to embedding is very indirect (through
+                    # 22 frozen DiffLlama layers + 4 ConvNeXt + expand_states), so
+                    # decouple gradient needs to dominate. lambda=100 gives:
+                    # 0.37 * 100 = 37 / 30 (flow) = 55% of total loss, and the
+                    # decouple gradient is DIRECT on the embedding (no layers).
+                    decouple_loss = decouple_loss * 100.0
 
                 loss = recon_loss + decouple_loss
 
