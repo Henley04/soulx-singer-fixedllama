@@ -119,15 +119,31 @@ class DataProcessor:
             if i >= len(mel2note) or i + j > len(mel2note):
                 break
             if i < len(mel2note) and mel2note[i] > 0:
-                # print(f"warning: overlap of {idx}: {mel2note[i]}")
                 while i < len(mel2note) and mel2note[i] > 0:
                     i += 1
-            mel2note[i] = ph_idx
-            k = i + 1
-            while k + j < next_phoneme_start:
-                mel2note[k : k + j] = torch.arange(ph_idx, ph_idx + j) + 1
-                k += j
-            mel2note[next_phoneme_start - 1] = ph_idx + j + 1
+            if i >= len(mel2note):
+                break
+            mel2note[i] = ph_idx  # BOW frame
+
+            # Fill phoneme frames between BOW and EOW.
+            # Use the same innerFrames logic as inference (preprocessing.js):
+            # reserve 2 frames (BOW + EOW), distribute the rest across j phonemes.
+            # This ensures each phoneme gets at least 1 frame even for short notes,
+            # preventing吞字 (swallowed syllables) from zero-frame phonemes.
+            inner_frames = max(0, next_phoneme_start - i - 2)
+            if inner_frames > 0 and j > 0:
+                for p in range(j):
+                    p_start = i + 1 + int(p * inner_frames / j)
+                    p_end = i + 1 + int((p + 1) * inner_frames / j)
+                    # Each phoneme p fills its own ID (ph_idx + 1 + p)
+                    if p_end > p_start:
+                        mel2note[p_start:p_end] = ph_idx + 1 + p
+                    elif p_start < next_phoneme_start and p_start < len(mel2note):
+                        # Ensure at least 1 frame per phoneme when possible
+                        mel2note[p_start] = ph_idx + 1 + p
+
+            if next_phoneme_start - 1 > i and next_phoneme_start - 1 < len(mel2note):
+                mel2note[next_phoneme_start - 1] = ph_idx + j + 1  # EOW frame
             ph_idx += j + 2     # <BOW> + ph repeats + <EOW>
 
         new_phonemes = ["<PAD>"] + new_phonemes

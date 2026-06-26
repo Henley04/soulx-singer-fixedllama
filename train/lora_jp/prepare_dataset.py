@@ -298,8 +298,19 @@ def lab_phonemes_to_notes(
     note_pitches = []
     note_types = []
 
-    # Minimum duration: 3 mel frames to prevent DataProcessor overlap bug.
-    min_dur = 3 * hop_size / sample_rate
+    # Minimum duration: 6 mel frames (0.12s @ 24kHz/480hop).
+    # A CV syllable needs BOW(1) + consonant(1) + vowel(1) + EOW(1) = 4 tokens,
+    # but mel2note padding needs extra room to avoid overlap with the next
+    # note's BOW. 6 frames gives a safe margin and prevents吞字 (swallowed
+    # syllables) caused by too-short notes where phoneme frames get squeezed
+    # to zero by the BOW/EOW padding.
+    min_dur = 6 * hop_size / sample_rate
+
+    # Maximum duration: 2.0s (100 frames). Notes longer than this are
+    # truncated to prevent爆音 (clipping) caused by flow-matching error
+    # accumulation over very long sustained vowels. The original PJS labels
+    # sometimes have notes up to 3.5s which destabilizes training.
+    max_dur = 2.0
 
     # Split lab into syllables first.
     syllables = split_lab_into_syllables(lab_segments)
@@ -314,6 +325,10 @@ def lab_phonemes_to_notes(
         note_end = note['end']
         note_pitch = note['pitch']
         note_duration = note_end - note_start
+        # Clamp duration to [min_dur, max_dur] to prevent吞字 (too short)
+        # and爆音 (too long). Short notes get stretched to min_dur; long
+        # notes get truncated to max_dur.
+        note_duration = max(min_dur, min(note_duration, max_dur))
         note_center = (note_start + note_end) / 2
 
         # Insert SP note for gap between previous note and this note

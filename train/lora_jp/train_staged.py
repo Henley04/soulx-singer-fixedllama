@@ -62,7 +62,7 @@ EMBED_DIM = 512
 # Phase configs
 PHASE_CONFIGS = {
     1: {"epochs": 15, "freeze_embed": True,  "embed_lr_ratio": 0.0, "loss_threshold": None, "decouple": True},
-    2: {"epochs": 40, "freeze_embed": False, "embed_lr_ratio": 0.2, "loss_threshold": None, "decouple": True},
+    2: {"epochs": 40, "freeze_embed": False, "embed_lr_ratio": 0.5, "loss_threshold": None, "decouple": True},
     3: {"epochs": 80, "freeze_embed": False, "embed_lr_ratio": 1.0, "loss_threshold": None, "decouple": False},
 }
 

@@ -156,10 +156,15 @@ def initialize_jp_embeddings(embed_weight, mapping, phone2idx):
 
         if init_weight >= 1.0:
             # Full initialization from source — add orthogonal noise to break
-            # exact copies (cosine_sim would be 1.0 otherwise, preventing learning)
+            # exact copies (cosine_sim would be 1.0 otherwise, preventing learning).
+            # noise_scale=0.5 brings initial cos from 1.0 to ~0.894 (1/sqrt(1+0.5²)),
+            # which is close to the decouple_loss target (0.85). With the previous
+            # 0.12 scale, cos stayed at ~0.993 and the decouple gradient was ~0
+            # (d(cos)/dw → 0 near cos=1), so JP phonemes never separated from EN
+            # sources — causing phoneme collapse and吞字/混淆.
             has_single_source = len(pending[jp_phone].get("source_details", [])) <= 1
             if has_single_source:
-                embed_weight[jp_idx] = add_orthogonal_noise(weighted_sum, noise_scale=0.12)
+                embed_weight[jp_idx] = add_orthogonal_noise(weighted_sum, noise_scale=0.5)
             else:
                 embed_weight[jp_idx] = weighted_sum
             initialized[jp_phone] = {
