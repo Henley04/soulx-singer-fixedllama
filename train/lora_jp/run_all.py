@@ -2,25 +2,23 @@
 End-to-end JP LoRA fine-tuning orchestrator.
 
 Runs the full pipeline in one shot:
-  Step -1: quantize_base_to_nvfp4.py -> pretrained_models/SoulX-Singer-nvfp4/
   Step 0:  init_embeddings.py  -> outputs/lora_jp/init_embed.pt
-  Step 1:  train_staged phase1 (warmup, freeze embed, NVFP4 base)
-  Step 2:  train_staged phase2 (embed FT, lower LR, NVFP4 base)
-  Step 3:  train_staged phase3 (joint, full FT, NVFP4 base)
-  Step 4:  export_onnx.py -> onnx_models/fp16/JP/ (dequantize to fp16)
+  Step 1:  train_staged phase1 (warmup, freeze embed, bf16 autocast)
+  Step 2:  train_staged phase2 (embed FT, lower LR, bf16 autocast)
+  Step 3:  train_staged phase3 (joint, full FT, bf16 autocast)
+  Step 4:  export_onnx.py -> onnx_models/fp16/JP/ (fp16)
 
 All parameters are baked in below — just run:
     python train/lora_jp/run_all.py            # resume (skip done stages)
     python train/lora_jp/run_all.py --force    # re-run ALL stages from scratch
-    python train/lora_jp/run_all.py --stage 1  # run only a specific stage (-1/0/1/2/3/4)
+    python train/lora_jp/run_all.py --stage 1  # run only a specific stage (0/1/2/3/4)
 
 Stage chaining convention (matches train_staged.py defaults):
   stage1 -> outputs/lora_jp/stage1/best.pt
   stage2 -> outputs/lora_jp/stage2/best.pt
   stage3 -> outputs/lora_jp/stage3/best.pt
 
-NVFP4 QLoRA is enabled by default on Blackwell (sm100+); falls back to
-fp16 AMP on older GPUs. Override the constants below to taste.
+Precision: bf16 autocast + gradient checkpointing (no NVFP4, no precision loss).
 """
 import os
 import sys
@@ -38,7 +36,6 @@ CONFIG = {
     "dataset_meta":   "train/lora_jp/dataset/metadata.json",
     "dataset_wav":    "train/lora_jp/dataset/wavs",
     "output_dir":     "outputs/lora_jp",
-    "nvfp4_base":     "pretrained_models/SoulX-Singer-nvfp4/model.pt",
     "app_root":       os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")),
 
     # Init embeddings
@@ -46,7 +43,7 @@ CONFIG = {
 
     # Training
     "device":         "cuda",
-    "batch_size":     1,
+    "batch_size":     4,
     "lr_phase1":      5e-5,
     "lr_phase2":      5e-5,
     "lr_phase3":      2e-5,
@@ -54,8 +51,8 @@ CONFIG = {
     "val_ratio":      0.1,
     "seed":           42,
 
-    # Precision (NVFP4 auto-fallback to fp16 AMP if not Blackwell)
-    "nvfp4":          True,
+    # Gradient checkpointing (enabled by default)
+    "grad_checkpoint": True,
 
     # Skip already-completed stages (idempotent re-runs)
     "skip_if_done":   True,
@@ -80,8 +77,8 @@ def main():
     parser = argparse.ArgumentParser(description="End-to-end JP LoRA training")
     parser.add_argument("--force", action="store_true",
                         help="Ignore existing checkpoints and re-run all stages")
-    parser.add_argument("--stage", type=int, choices=[-1, 0, 1, 2, 3, 4], default=None,
-                        help="Run only a specific stage (-1=quant base, 0=init, 1/2/3=train, 4=export). Default: all.")
+    parser.add_argument("--stage", type=int, choices=[0, 1, 2, 3, 4], default=None,
+                        help="Run only a specific stage (0=init, 1/2/3=train, 4=export). Default: all.")
     args = parser.parse_args()
 
     cfg = CONFIG
@@ -101,18 +98,6 @@ def main():
     stage3_ckpt = os.path.join(out, "stage3", "best.pt")
 
     py = sys.executable
-
-    nvfp4_base = cfg["nvfp4_base"]
-
-    # ── Step -1: quantize base model to NVFP4 (one-time) ───────────
-    if args.stage is not None and args.stage != -1:
-        print("[SKIP] base quantization not selected")
-    elif skip and exists(nvfp4_base):
-        print(f"[SKIP] NVFP4 base already exists: {nvfp4_base}")
-    else:
-        run([py, "train/lora_jp/quantize_base_to_nvfp4.py",
-             "--model_path", cfg["model_path"],
-             "--output_dir", os.path.dirname(nvfp4_base)], cwd=repo)
 
     # ── Step 0: init embeddings ─────────────────────────────────────
     if args.stage is not None and args.stage != 0:
@@ -146,11 +131,9 @@ def main():
              "--device",          cfg["device"],
              "--batch_size",      str(cfg["batch_size"]),
              "--lr",              str(cfg["lr_phase1"]),
-             "--nvfp4_base",      nvfp4_base,
              "--num_workers",     str(cfg["num_workers"]),
              "--val_ratio",       str(cfg["val_ratio"]),
-             "--seed",            str(cfg["seed"]),
-             "--nvfp4" if cfg["nvfp4"] else "--no-nvfp4"], cwd=repo)
+             "--seed",            str(cfg["seed"])], cwd=repo)
 
     # ── Step 2: Phase 2 (embed FT) ──────────────────────────────────
     if args.stage is not None and args.stage != 2:
@@ -171,11 +154,9 @@ def main():
              "--device",          cfg["device"],
              "--batch_size",      str(cfg["batch_size"]),
              "--lr",              str(cfg["lr_phase2"]),
-             "--nvfp4_base",      nvfp4_base,
              "--num_workers",     str(cfg["num_workers"]),
              "--val_ratio",       str(cfg["val_ratio"]),
-             "--seed",            str(cfg["seed"]),
-             "--nvfp4" if cfg["nvfp4"] else "--no-nvfp4"], cwd=repo)
+             "--seed",            str(cfg["seed"])], cwd=repo)
 
     # ── Step 3: Phase 3 (joint) ─────────────────────────────────────
     if args.stage is not None and args.stage != 3:
@@ -196,13 +177,11 @@ def main():
              "--device",          cfg["device"],
              "--batch_size",      str(cfg["batch_size"]),
              "--lr",              str(cfg["lr_phase3"]),
-             "--nvfp4_base",      nvfp4_base,
              "--num_workers",     str(cfg["num_workers"]),
              "--val_ratio",       str(cfg["val_ratio"]),
-             "--seed",            str(cfg["seed"]),
-             "--nvfp4" if cfg["nvfp4"] else "--no-nvfp4"], cwd=repo)
+             "--seed",            str(cfg["seed"])], cwd=repo)
 
-    # ── Step 4: export ONNX (dequantize to fp16, place in JP dir) ────
+    # ── Step 4: export ONNX (fp16, place in JP dir) ─────────────────
     jp_dir = os.path.join(cfg["app_root"], "onnx_models", "fp16", "JP")
     if args.stage is not None and args.stage != 4:
         print("[SKIP] export stage not selected")
