@@ -218,7 +218,6 @@ def main():
             "cond_emb is required for correct JP inference. Re-train with "
             "the updated train_staged.py (which saves cond_emb) before export."
         )
-    from soulxsinger.models.modules.flow_matching import CFMDecoder
     # Build a Linear(512, 1024) and load the fine-tuned weights.
     # We don't need the full CFMDecoder — just the cond_emb submodule.
     cond_emb_linear = nn.Linear(EMBED_DIM, 1024)
