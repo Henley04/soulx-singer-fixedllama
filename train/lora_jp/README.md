@@ -100,10 +100,16 @@ python train/lora_jp/export_onnx.py \
 |------|------|---------|
 | note_text_encoder.onnx | 扩展嵌入 (3033×512, FP16) | ✅ |
 | preflow.onnx | 微调后 preflow (无 LayerNorm) | ✅ |
+| cond_emb.onnx | 微调后条件嵌入投影 (512→1024, FP16) | ✅ |
 | note_pitch_encoder.onnx | 音高嵌入 | ❌ (共享 base 模型) |
 
-**部署方式**：将 `note_text_encoder.onnx` 和 `preflow.onnx` 放到
-`onnx_models/fp16/JP/` 目录。SXSEditor 会自动检测 JP 模型并在日语歌词时切换。
+**部署方式**：将 `note_text_encoder.onnx`、`preflow.onnx` 和 `cond_emb.onnx` 放到
+`onnx_models/fp16/JP/` 目录。SXSEditor 会自动检测 JP 模型（三者必须同时存在）
+并在日语歌词时切换。
+
+**重要**：`cond_emb.onnx` 必须与 JP `preflow.onnx`/`note_text_encoder.onnx` 一起部署。
+训练时 `cond_emb` 被微调以适配日语音素分布，若推理时使用 base 的 `cond_emb` 会导致
+严重音素错乱（例如 "わたしの" → "nin to shi so"）。
 
 `phone_set.json` 需同步更新到 `src/inference/phone_set.json`（已包含 3033 个音素）。
 
@@ -121,11 +127,16 @@ python train/lora_jp/export_onnx.py \
 
 ### 音素包裹格式（关键修复）
 
-**修复前**（导致音素混淆）：prepare_dataset.py 把一个 MIDI note 内的辅音+元音拆成独立 entry，
+**修复前 v1**（导致音素混淆）：prepare_dataset.py 把一个 MIDI note 内的辅音+元音拆成独立 entry，
 每个音素独立 BOW/EOW。训练 token: `[PAD BOW jp_t EOW BOW jp_a EOW ...]`
 
-**修复后**（与推理一致）：一个 MIDI note 的所有音素合并成一个 entry `jp_t-a`，
-共享一个 BOW/EOW。训练 token: `[PAD BOW jp_t jp_a EOW ...]`
+**修复前 v2**（导致 3+ 音素损坏条目）：把一个 MIDI note 时间范围内**所有**重叠的 lab 音素
+合并成一个 entry，长 note 会跨多个音节，产生 `jp_t-a-a`、`jp_sh-y-u-o` 等损坏条目
+（2379 条损坏数据）。
+
+**修复后**（按音节切分）：先将 lab 音素流切分为音节单元（CV / V / cl），再为每个 MIDI note
+分配其中心时间所在的单个音节，确保每个 note 最多 2 个音素（辅音+元音）。
+训练 token: `[PAD BOW jp_t jp_a EOW ...]`
 
 此格式与 SXSEditor 推理侧 [preprocessing.js](../../../src/inference/pipeline/preprocessing.js) 的处理完全一致：
 一个 note 调用 `_japaneseG2p` 得到多音素，全部放在同一个 BOW/EOW 块内（不加 SEP）。

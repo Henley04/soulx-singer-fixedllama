@@ -82,6 +82,90 @@ CONSONANTS = {
     'f', 'j', 'ch', 'sh', 'ts', 'ky', 'gy', 'ny', 'hy', 'my', 'ry', 'py', 'by', 'cl',
 }
 
+# Vowels (everything else not in CONSONANTS and not pau/xx is a vowel).
+# Includes lowercase a/i/u/e/o and PJS uppercase variants I/N/O/U.
+VOWELS = {'a', 'i', 'u', 'e', 'o', 'I', 'N', 'O', 'U'}
+
+
+def split_lab_into_syllables(lab_segments: List[Dict]) -> List[Dict]:
+    """Group lab phonemes into syllable units (CV or V or cl).
+
+    A syllable = optional consonant cluster + one vowel. The促音 'cl' is a
+    standalone syllable. 'pau'/'xx' are pauses (returned as their own unit
+    so callers can decide how to handle them).
+
+    Each returned dict: {'start', 'end', 'phonemes': [raw_lab_phonemes]}.
+    """
+    syllables = []
+    i = 0
+    n = len(lab_segments)
+    while i < n:
+        seg = lab_segments[i]
+        ph = seg['phoneme']
+
+        # Pause / unknown -> standalone unit
+        if ph in ('pau', 'xx'):
+            syllables.append({
+                'start': seg['start'],
+                'end': seg['end'],
+                'phonemes': [ph],
+                'is_pause': True,
+            })
+            i += 1
+            continue
+
+        # 促音 cl -> standalone syllable
+        if ph == 'cl':
+            syllables.append({
+                'start': seg['start'],
+                'end': seg['end'],
+                'phonemes': [ph],
+                'is_pause': False,
+            })
+            i += 1
+            continue
+
+        # Vowel-only syllable (no leading consonant)
+        if ph in VOWELS:
+            syllables.append({
+                'start': seg['start'],
+                'end': seg['end'],
+                'phonemes': [ph],
+                'is_pause': False,
+            })
+            i += 1
+            continue
+
+        # Consonant: collect consonant cluster + following vowel (if any).
+        # Handles 'my', 'ky', etc. as single consonant units.
+        cons_phonemes = [ph]
+        cons_start = seg['start']
+        cons_end = seg['end']
+        j = i + 1
+        # If the next segment is a vowel, attach it to form a CV syllable.
+        if j < n and lab_segments[j]['phoneme'] in VOWELS:
+            vow_seg = lab_segments[j]
+            syllables.append({
+                'start': cons_start,
+                'end': vow_seg['end'],
+                'phonemes': [ph, vow_seg['phoneme']],
+                'is_pause': False,
+            })
+            i = j + 1
+            continue
+
+        # Consonant with no following vowel (e.g., utterance-final 'n').
+        # Treat as standalone syllable.
+        syllables.append({
+            'start': cons_start,
+            'end': cons_end,
+            'phonemes': cons_phonemes,
+            'is_pause': False,
+        })
+        i += 1
+
+    return syllables
+
 
 def parse_lab_file(lab_path: str) -> List[Dict]:
     """Parse .lab file. Each line: start_time_100ns end_time_100ns phoneme
@@ -192,14 +276,17 @@ def lab_phonemes_to_notes(
     sample_rate: int = 24000,
     hop_size: int = 480,
 ) -> Tuple[List[str], List[float], List[int], List[int]]:
-    """
-    Align lab phonemes to MIDI notes.
+    """Align lab phonemes to MIDI notes on a per-syllable basis.
 
-    For each MIDI note, include all matching phonemes (consonant + vowel).
-    Consonants get a short duration, vowels get the remaining duration.
-    Inserts <SP> notes between non-adjacent MIDI notes to align with
-    SXSEditor inference (which auto-inserts SP for gaps).
-    Returns: (phonemes, durations, note_pitches, note_types)
+    Strategy: split the lab phoneme stream into syllable units (CV / V / cl),
+    then assign each MIDI note to the single syllable whose time range
+    overlaps the note's center. This avoids the previous bug where a long
+    MIDI note absorbed phonemes from multiple syllables (producing entries
+    like "jp_t-a-a" with 3+ phonemes).
+
+    Each MIDI note -> exactly one syllable -> at most 2 phonemes
+    (consonant + vowel), matching SXSEditor inference where one note = one
+    BOW/EOW block.
 
     note_type values (must match SXSEditor preprocessing.js):
       1 = SP (short pause / rest)
@@ -212,10 +299,14 @@ def lab_phonemes_to_notes(
     note_types = []
 
     # Minimum duration: 3 mel frames to prevent DataProcessor overlap bug.
-    # preprocess() expands each phoneme to BOW+phoneme+EOW (3 tokens).
-    # With only 2 frames, BOW+EOW consume all frames and the actual
-    # phoneme gets 0 frames, causing it to be skipped in mel2note.
     min_dur = 3 * hop_size / sample_rate
+
+    # Split lab into syllables first.
+    syllables = split_lab_into_syllables(lab_segments)
+
+    # Track which syllables have been consumed to detect slurs (a note
+    # landing on an already-consumed syllable = continuation/slur).
+    consumed = [False] * len(syllables)
 
     prev_note_end = None
     for ni, note in enumerate(midi_notes):
@@ -223,6 +314,7 @@ def lab_phonemes_to_notes(
         note_end = note['end']
         note_pitch = note['pitch']
         note_duration = note_end - note_start
+        note_center = (note_start + note_end) / 2
 
         # Insert SP note for gap between previous note and this note
         # (matches SXSEditor midiParser.js auto-SP insertion logic)
@@ -234,89 +326,63 @@ def lab_phonemes_to_notes(
             note_types.append(1)    # SP
         prev_note_end = note_end
 
-        # Find lab phonemes within this note's time range
-        matching_phonemes = []
-        for seg in lab_segments:
-            seg_start = seg['start']
-            seg_end = seg['end']
-            if seg_start < note_end and seg_end > note_start:
-                matching_phonemes.append(seg)
+        # Find the syllable whose time range contains the note's center.
+        # Prefer unconsumed syllables; if all are consumed, pick the closest
+        # one (treat as slur).
+        best_idx = -1
+        best_dist = float('inf')
+        for si, syl in enumerate(syllables):
+            # Overlap check: syllable overlaps note
+            if syl['end'] <= note_start or syl['start'] >= note_end:
+                continue
+            # Distance from note center to syllable center
+            syl_center = (syl['start'] + syl['end']) / 2
+            dist = abs(note_center - syl_center)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = si
 
-        if not matching_phonemes:
+        if best_idx == -1:
+            # No overlapping syllable — fallback to a bare vowel.
             phonemes.append('jp_a')
-            durations.append(note_duration)
+            durations.append(max(note_duration, min_dur))
             note_pitches.append(note_pitch)
-            note_types.append(2)  # normal note
+            note_types.append(2)
             continue
 
-        # Split into consonants and vowels
-        consonants = []
-        vowels = []
-        for seg in matching_phonemes:
-            raw_ph = seg['phoneme']
-            jp_ph = PHONEME_MAP.get(raw_ph, f'jp_{raw_ph}')
-            seg_start_in_note = max(seg['start'], note_start)
-            seg_end_in_note = min(seg['end'], note_end)
-            seg_duration = max(0.001, seg_end_in_note - seg_start_in_note)
+        syl = syllables[best_idx]
+        is_slur = consumed[best_idx]
+        consumed[best_idx] = True
 
-            if raw_ph in CONSONANTS or raw_ph == 'cl':
-                consonants.append({'ph': jp_ph, 'dur': seg_duration})
-            else:
-                vowels.append({'ph': jp_ph, 'dur': seg_duration})
-
-        # If no vowels found, use the first phoneme
-        if not vowels:
-            raw_ph = matching_phonemes[0]['phoneme']
-            jp_ph = PHONEME_MAP.get(raw_ph, f'jp_{raw_ph}')
-            phonemes.append(jp_ph)
-            durations.append(note_duration)
-            # pau maps to <SP> -> type=1; others -> type=2
-            is_pause = (jp_ph == '<SP>')
-            note_pitches.append(0 if is_pause else note_pitch)
-            note_types.append(1 if is_pause else 2)
-            continue
-
-        # Total consonant and vowel durations from lab timing
-        total_cons_dur = sum(c['dur'] for c in consonants)
-        total_vowel_dur = sum(v['dur'] for v in vowels)
-        total_lab_dur = total_cons_dur + total_vowel_dur
-
-        # Scale durations to fit the note duration
-        if total_lab_dur > 0:
-            scale = note_duration / total_lab_dur
-        else:
-            scale = 1.0
-
-        # Determine note_type: slur if this note shares a syllable with
-        # the previous note (i.e., consonants empty, only vowels, and
-        # previous note ended exactly where this one starts).
-        is_slur = (len(consonants) == 0
-                   and ni > 0
-                   and midi_notes[ni-1]['end'] >= note_start - 0.01)
-
-        # Merge all phonemes in this note into ONE entry (e.g. "jp_t-a"),
-        # matching inference-side preprocessing (preprocessing.js) where one
-        # note = one BOW/EOW block containing all its phonemes. This is the
-        # root-cause fix for scrambled Japanese pronunciation: previously each
-        # phoneme got its own BOW/EOW in training, but inference groups all
-        # phonemes of a note under a single BOW/EOW, causing token-structure
-        # mismatch and unintelligible output.
-        all_phonemes_in_note = [c['ph'] for c in consonants] + [v['ph'] for v in vowels]
-        # Filter out <SP> (shouldn't be inside a note, but guard anyway)
-        all_phonemes_in_note = [p for p in all_phonemes_in_note if p != '<SP>']
-        if not all_phonemes_in_note:
-            # All phonemes were <SP>; treat as SP note
+        # Pause syllable -> SP note
+        if syl.get('is_pause', False):
             phonemes.append('<SP>')
             durations.append(max(note_duration, min_dur))
             note_pitches.append(0)
             note_types.append(1)
             continue
-        # Strip 'jp_' prefix and join with '-' (same format as en_HH-UW1)
-        merged_phoneme = 'jp_' + '-'.join(p[3:] for p in all_phonemes_in_note)
+
+        # Build merged phoneme string from the syllable's lab phonemes.
+        # Each raw phoneme -> jp_* ; join with '-' (e.g. "jp_t-a").
+        jp_parts = []
+        for raw_ph in syl['phonemes']:
+            jp_ph = PHONEME_MAP.get(raw_ph, f'jp_{raw_ph}')
+            if jp_ph == '<SP>':
+                continue
+            jp_parts.append(jp_ph)
+        if not jp_parts:
+            phonemes.append('<SP>')
+            durations.append(max(note_duration, min_dur))
+            note_pitches.append(0)
+            note_types.append(1)
+            continue
+
+        merged_phoneme = 'jp_' + '-'.join(p[3:] for p in jp_parts)
         phonemes.append(merged_phoneme)
         durations.append(max(note_duration, min_dur))
         note_pitches.append(note_pitch)
-        # slur (3) if applicable, else normal (2)
+        # slur (3) if this syllable was already consumed by a previous note,
+        # else normal (2).
         note_types.append(3 if is_slur else 2)
 
     return phonemes, durations, note_pitches, note_types

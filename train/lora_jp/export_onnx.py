@@ -104,6 +104,24 @@ class TextEncoderONNX(nn.Module):
         return self.embedding(input_ids)
 
 
+class CondEmbONNX(nn.Module):
+    """Wrapper for the fine-tuned cond_emb (Linear 512->1024).
+
+    SXSEditor inference (preprocessing.js) calls cond_emb.onnx with
+    input name 'cond_code' (float, [1, T, 512]) and expects output
+    'cond_embedding' ([1, T, 1024]). This wrapper matches that contract.
+    Training fine-tunes cond_emb to adapt the JP feature distribution, so
+    it MUST be exported and loaded at inference — using the base cond_emb
+    with JP fine-tuned preflow+embedding causes severe phoneme corruption.
+    """
+    def __init__(self, cond_emb_linear):
+        super().__init__()
+        self.cond_emb = cond_emb_linear
+
+    def forward(self, cond_code):
+        return self.cond_emb(cond_code)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str, default='outputs/lora_jp/stage3/best.pt')
@@ -188,19 +206,56 @@ def main():
     pf_data_size = os.path.getsize(pf_data_path) if os.path.exists(pf_data_path) else 0
     print(f'  {pf_path}: {(pf_size + pf_data_size) / 1024 / 1024:.2f} MB')
 
+    # Export FP16 cond_emb (Linear 512->1024, fine-tuned for JP).
+    # This is critical: training adapts cond_emb to the JP feature
+    # distribution, so inference MUST use the fine-tuned cond_emb. Using the
+    # base cond_emb with JP preflow+embedding causes severe phoneme
+    # corruption (e.g. "watashino" -> "nin to shi so").
+    print('\nExporting FP16 cond_emb.onnx...')
+    if 'cond_emb_state_dict' not in ft_ckpt:
+        raise RuntimeError(
+            "Checkpoint missing 'cond_emb_state_dict'. The fine-tuned "
+            "cond_emb is required for correct JP inference. Re-train with "
+            "the updated train_staged.py (which saves cond_emb) before export."
+        )
+    from soulxsinger.models.modules.flow_matching import CFMDecoder
+    # Build a Linear(512, 1024) and load the fine-tuned weights.
+    # We don't need the full CFMDecoder — just the cond_emb submodule.
+    cond_emb_linear = nn.Linear(EMBED_DIM, 1024)
+    cond_emb_linear.load_state_dict(ft_ckpt['cond_emb_state_dict'])
+    cond_model = CondEmbONNX(cond_emb_linear)
+    cond_model.half().eval()
+    dummy_cond = torch.randn(1, 20, EMBED_DIM).half()
+    cond_path = os.path.join(args.output_dir, 'cond_emb.onnx')
+    torch.onnx.export(
+        cond_model, (dummy_cond,), cond_path,
+        input_names=['cond_code'], output_names=['cond_embedding'],
+        dynamic_axes={'cond_code': {1: 'seq'}, 'cond_embedding': {1: 'seq'}},
+        opset_version=args.opset,
+        dynamo=False,
+    )
+    cond_size = os.path.getsize(cond_path)
+    cond_data_path = cond_path + '.data'
+    cond_data_size = os.path.getsize(cond_data_path) if os.path.exists(cond_data_path) else 0
+    print(f'  {cond_path}: {(cond_size + cond_data_size) / 1024 / 1024:.2f} MB')
+
     # NOTE: note_pitch_encoder is intentionally NOT exported.
     # JP LoRA shares the base model's pitch encoder because:
     # 1. note_pitch is a MIDI index (0-127) with no language-specific semantic
-    # 2. SXSEditor's JP_MODEL_FILES only requires note_text_encoder + preflow
-    # 3. Exporting a JP-specific pitch_encoder would cause the encoder to be
-    #    hot-swapped on language switch, but pitch semantics are identical,
-    #    so the swap is unnecessary and risks train/inference mismatch.
-    print('\nSkipping note_pitch_encoder export (shared with base model).')
+    # 2. Exporting a JP-specific pitch_encoder would cause train/inference
+    #    mismatch when switching languages (pitch semantics are identical).
+    # If a stale note_pitch_encoder.onnx exists in the output dir from a
+    # previous (buggy) export, remove it so SXSEditor uses the base model's.
+    stale_pitch = os.path.join(args.output_dir, 'note_pitch_encoder.onnx')
+    if os.path.exists(stale_pitch):
+        os.remove(stale_pitch)
+        print(f'\nRemoved stale note_pitch_encoder.onnx (was incorrectly exported before).')
+    print('Skipping note_pitch_encoder export (shared with base model).')
 
     # Verify ONNX models
     print('\nVerifying ONNX models...')
     import onnxruntime as ort
-    for fname in ['note_text_encoder.onnx', 'preflow.onnx']:
+    for fname in ['note_text_encoder.onnx', 'preflow.onnx', 'cond_emb.onnx']:
         fpath = os.path.join(args.output_dir, fname)
         sess = ort.InferenceSession(fpath, providers=['CPUExecutionProvider'])
         inp = sess.get_inputs()[0]
@@ -232,7 +287,7 @@ def main():
     print(f'\n  <SP> (ID={sp_id}) embedding: mean={sp_out.mean():.6f}, std={sp_out.std():.6f}')
 
     print(f'\nExport complete. Files in: {args.output_dir}')
-    print('Exported: note_text_encoder, preflow.')
+    print('Exported: note_text_encoder, preflow, cond_emb.')
     print('Skipped: note_pitch_encoder (shared with base model).')
     print('Other models (diff_step, vocoder, etc.) are used as-is from base.')
 

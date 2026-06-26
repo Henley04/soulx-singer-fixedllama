@@ -146,12 +146,6 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_pa
             else:
                 model.note_text_encoder.weight.data[:ft_weight.shape[0]] = ft_weight
 
-        # Restore pitch encoder
-        if 'pitch_encoder_state_dict' in ckpt:
-            pe_weight = ckpt['pitch_encoder_state_dict']['weight']
-            pe_weight = pe_weight.to(model.note_pitch_encoder.weight.device)
-            model.note_pitch_encoder.weight.data[:pe_weight.shape[0]] = pe_weight
-
         # Restore cond_emb (Linear(512, 1024) inside cfm_decoder that projects
         # decoder_inp features to the diff_estimator hidden size).
         # Note: old checkpoints produced by the MelProjection variant do not
@@ -453,7 +447,6 @@ def save_checkpoint(model, epoch, loss, output_dir, phase):
         'phase': phase,
         'preflow_state_dict': model.preflow.state_dict(),
         'embed_state_dict': {'weight': embed_weight},
-        'pitch_encoder_state_dict': {'weight': model.note_pitch_encoder.weight.data.clone()},
         'jp_embed': embed_weight[JP_PHONEME_START:JP_PHONEME_START+JP_PHONEME_COUNT].clone(),
         'cond_emb_state_dict': model.cfm_decoder.model.cond_emb.state_dict(),
     }
