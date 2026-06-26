@@ -16,7 +16,7 @@
 ```
 train/lora_jp/
 ├── jp_phone_set.json       # 扩展音素表 (3000 base + 33 JP = 3033)
-├── jp_phoneme_mapping.json # JP 音素到 EN/ZH 源音素的映射 (配置驱动)
+├── jp_phoneme_mapping.json # JP 音素到 EN 源音素的映射 (配置驱动)
 ├── prepare_dataset.py      # PJS Corpus → 训练数据 (含 SP/slur 样本)
 ├── dataset.py              # PyTorch Dataset (确定性 wav 匹配)
 ├── phoneme_mapping.py      # 生成 jp_phoneme_mapping.json
@@ -110,11 +110,23 @@ python train/lora_jp/export_onnx.py \
 | 环节 | 一致性 |
 |------|--------|
 | BOW/EOW/SEP token | ✅ 日语不加 SEP（与英文不同） |
+| **BOW/EOW 包裹结构** | ✅ 一个 note 的所有音素共享一个 BOW/EOW（`jp_t-a` 格式，匹配推理） |
 | note_pitch (MIDI 0-127) | ✅ 直接索引 Embedding(256)，pitch_encoder 冻结复用 base |
 | note_type (1=SP, 2=normal, 3=slur) | ✅ 训练数据含 SP 和 slur 样本 |
 | f0 量化 (361 bins, 20 cents) | ✅ |
 | preflow 输入 (无 LayerNorm) | ✅ |
 | 停顿音素 (`<SP>` ID=1) | ✅ 训练-推理统一 |
+
+### 音素包裹格式（关键修复）
+
+**修复前**（导致音素混淆）：prepare_dataset.py 把一个 MIDI note 内的辅音+元音拆成独立 entry，
+每个音素独立 BOW/EOW。训练 token: `[PAD BOW jp_t EOW BOW jp_a EOW ...]`
+
+**修复后**（与推理一致）：一个 MIDI note 的所有音素合并成一个 entry `jp_t-a`，
+共享一个 BOW/EOW。训练 token: `[PAD BOW jp_t jp_a EOW ...]`
+
+此格式与 SXSEditor 推理侧 [preprocessing.js](../../../src/inference/pipeline/preprocessing.js) 的处理完全一致：
+一个 note 调用 `_japaneseG2p` 得到多音素，全部放在同一个 BOW/EOW 块内（不加 SEP）。
 
 ## pitch_encoder 冻结说明
 

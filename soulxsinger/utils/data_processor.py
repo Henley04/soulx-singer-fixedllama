@@ -98,6 +98,13 @@ class DataProcessor:
                 ph_locations.append([dur, max(1, len(en_phs))])
                 new_phonemes.extend(en_phs)
                 note2origin.extend([ph_idx] * len(en_phs))
+            elif phonemes[ph_idx][:3] == "jp_":
+                # Japanese: split '-'-joined phonemes (e.g. "jp_t-a" -> ["jp_t", "jp_a"])
+                # No <SEP> — matches inference (preprocessing.js L171: "Don't add SEP_ID for Japanese")
+                jp_phs = ['jp_' + x for x in phonemes[ph_idx][3:].split('-')]
+                ph_locations.append([dur, max(1, len(jp_phs))])
+                new_phonemes.extend(jp_phs)
+                note2origin.extend([ph_idx] * len(jp_phs))
             else:
                 ph_locations.append([dur, 1])
                 new_phonemes.append(phonemes[ph_idx])

@@ -38,14 +38,16 @@ from train.lora_jp.train_staged import JP_PHONEME_START, JP_PHONEME_COUNT
 
 
 # Japanese test sentences: (lyric_phonemes, note_pitches, note_types, description)
-# Phonemes use jp_ prefix; pauses use <SP>; each entry is one note.
+# Each entry = one note. Multi-phoneme syllables use '-'-joined format
+# (e.g. "jp_s-a" for "sa") to match inference-side preprocessing where
+# one note = one BOW/EOW block. Single vowels use bare "jp_a".
 TEST_SENTENCES = [
     {
         "desc": "sa-ku-ra (sakura, cherry blossom)",
-        "phonemes": ["jp_s", "jp_a", "jp_k", "jp_u", "jp_r", "jp_a"],
-        "pitches": [60, 60, 62, 62, 64, 64],  # C4 C4 D4 D4 E4 E4
-        "durations": [0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
-        "types": [2, 2, 2, 2, 2, 2],
+        "phonemes": ["jp_s-a", "jp_k-u", "jp_r-a"],
+        "pitches": [60, 62, 64],  # C4 D4 E4
+        "durations": [0.4, 0.4, 0.4],
+        "types": [2, 2, 2],
     },
     {
         "desc": "a-i-u-e-o (vowels)",
@@ -56,23 +58,30 @@ TEST_SENTENCES = [
     },
     {
         "desc": "ka-ki-ku-ke-ko (k + vowels)",
-        "phonemes": ["jp_k", "jp_a", "jp_k", "jp_i", "jp_k", "jp_u", "jp_k", "jp_e", "jp_k", "jp_o"],
-        "pitches": [60, 60, 62, 62, 64, 64, 65, 65, 67, 67],
-        "durations": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
-        "types": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+        "phonemes": ["jp_k-a", "jp_k-i", "jp_k-u", "jp_k-e", "jp_k-o"],
+        "pitches": [60, 62, 64, 65, 67],
+        "durations": [0.4, 0.4, 0.4, 0.4, 0.4],
+        "types": [2, 2, 2, 2, 2],
     },
     {
         "desc": "sa-ku-ra with pause",
-        "phonemes": ["jp_s", "jp_a", "jp_k", "jp_u", "<SP>", "jp_r", "jp_a"],
-        "pitches": [60, 60, 62, 62, 0, 64, 64],
-        "durations": [0.3, 0.3, 0.3, 0.3, 0.4, 0.3, 0.3],
-        "types": [2, 2, 2, 2, 1, 2, 2],
+        "phonemes": ["jp_s-a", "jp_k-u", "<SP>", "jp_r-a"],
+        "pitches": [60, 62, 0, 64],
+        "durations": [0.4, 0.4, 0.4, 0.4],
+        "types": [2, 2, 1, 2],
     },
     {
         "desc": "ha-ru (spring)",
-        "phonemes": ["jp_h", "jp_a", "jp_r", "jp_u"],
-        "pitches": [64, 64, 62, 62],
-        "durations": [0.3, 0.3, 0.3, 0.3],
+        "phonemes": ["jp_h-a", "jp_r-u"],
+        "pitches": [64, 62],
+        "durations": [0.4, 0.4],
+        "types": [2, 2],
+    },
+    {
+        "desc": "wa-ta-shi-no (watashino, my/mine)",
+        "phonemes": ["jp_w-a", "jp_t-a", "jp_sh-i", "jp_n-o"],
+        "pitches": [60, 60, 62, 62],
+        "durations": [0.4, 0.4, 0.4, 0.4],
         "types": [2, 2, 2, 2],
     },
 ]

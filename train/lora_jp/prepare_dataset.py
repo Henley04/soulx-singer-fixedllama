@@ -294,21 +294,30 @@ def lab_phonemes_to_notes(
                    and ni > 0
                    and midi_notes[ni-1]['end'] >= note_start - 0.01)
 
-        # Add consonant phonemes (each gets its proportional lab duration)
-        for c in consonants:
-            phonemes.append(c['ph'])
-            durations.append(max(c['dur'] * scale, min_dur))
-            note_pitches.append(note_pitch)
-            note_types.append(2)  # consonant = normal note (type 2)
-
-        # Add vowel phonemes
-        for v in vowels:
-            phonemes.append(v['ph'])
-            durations.append(max(v['dur'] * scale, min_dur))
-            note_pitches.append(note_pitch)
-            # First vowel after consonants: slur (3) if applicable, else normal (2)
-            # Subsequent vowels within same note: slur (3) — they're continuations
-            note_types.append(3 if is_slur else 2)
+        # Merge all phonemes in this note into ONE entry (e.g. "jp_t-a"),
+        # matching inference-side preprocessing (preprocessing.js) where one
+        # note = one BOW/EOW block containing all its phonemes. This is the
+        # root-cause fix for scrambled Japanese pronunciation: previously each
+        # phoneme got its own BOW/EOW in training, but inference groups all
+        # phonemes of a note under a single BOW/EOW, causing token-structure
+        # mismatch and unintelligible output.
+        all_phonemes_in_note = [c['ph'] for c in consonants] + [v['ph'] for v in vowels]
+        # Filter out <SP> (shouldn't be inside a note, but guard anyway)
+        all_phonemes_in_note = [p for p in all_phonemes_in_note if p != '<SP>']
+        if not all_phonemes_in_note:
+            # All phonemes were <SP>; treat as SP note
+            phonemes.append('<SP>')
+            durations.append(max(note_duration, min_dur))
+            note_pitches.append(0)
+            note_types.append(1)
+            continue
+        # Strip 'jp_' prefix and join with '-' (same format as en_HH-UW1)
+        merged_phoneme = 'jp_' + '-'.join(p[3:] for p in all_phonemes_in_note)
+        phonemes.append(merged_phoneme)
+        durations.append(max(note_duration, min_dur))
+        note_pitches.append(note_pitch)
+        # slur (3) if applicable, else normal (2)
+        note_types.append(3 if is_slur else 2)
 
     return phonemes, durations, note_pitches, note_types
 
