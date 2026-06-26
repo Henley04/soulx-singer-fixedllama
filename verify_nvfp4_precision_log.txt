@@ -1,0 +1,82 @@
+﻿python : W0626 20:31:03.347000 22652 site-packages\torch\utils\_pytree.py:630] <enum 'KernelPreference'> is an Enum sub
+class and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subcl
+asses is deprecated and will be an error in a future release.
+At line:15 char:3997
++ ... ulX-Singer; python train\lora_jp\verify_nvfp4_precision.py 2>&1 | Tee ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (W0626 20:31:03....future release.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+W0626 20:31:03.408000 22652 site-packages\torch\utils\_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass
+ and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses
+ is deprecated and will be an error in a future release.
+Device: NVIDIA GeForce RTX 5060 Laptop GPU (sm12)
+torch: 2.12.0+cu132, torchao: True
+[fp32] Loading: pretrained_models/SoulX-Singer/model.pt
+[nvfp4] Loading: pretrained_models/SoulX-Singer-nvfp4/model.pt
+[nvfp4] Assigned 276 NVFP4 Linear weight(s), skipped 0
+
+File size:
+  fp32  : 2687.54 MB
+  nvfp4 : 396.62 MB
+  ratio : 6.78x compression
+
+NVFP4 verification:
+  Linear layers with NVFP4Tensor weight : 276
+  Linear layers with regular Tensor weight: 1
+  -> NVFP4Tensor weights present. Quantization is REAL (not pseudo-quant).
+
+Running per-layer forward comparison on cuda...
+Compared 276/276 NVFP4 layers in 1.1s
+
+==============================================================================
+NVFP4 vs fp32 precision comparison
+==============================================================================
+Total nn.Linear layers in model : 277
+Layers quantized to NVFP4       : 276
+Layers compared (forward pass)  : 276
+==============================================================================
+Group                 #           MSE        RMSE      MaxAbs   RelRMSE      Cos
+------------------------------------------------------------------------------
+cond_emb              1  1.514339e-03    0.038915    0.171395   9.4488% 0.995528
+diff_estimator      207  7.512258e-03    0.082802    0.520225   9.5016% 0.995388
+preflow               8  4.910793e-03    0.070029    0.319668   9.5896% 0.995376
+vocoder              60  1.338539e-01    0.345491    2.124155   9.4457% 0.995502
+------------------------------------------------------------------------------
+OVERALL             276  3.488069e-02    0.139379    6.504849   9.4918% 0.995413
+==============================================================================
+
+Worst 10 layers by max abs error:
+Name                                                        Shape               MaxAbs      Cos
+-----------------------------------------------------------------------------------------------
+vocoder.model.backbone.convnext.29.pwconv2                  1024x4096         6.504849 0.995490
+vocoder.model.backbone.convnext.24.pwconv2                  1024x4096         3.480441 0.995674
+vocoder.model.backbone.convnext.25.pwconv1                  4096x1024         3.415685 0.995637
+vocoder.model.backbone.convnext.27.pwconv1                  4096x1024         3.375104 0.995632
+vocoder.model.backbone.convnext.14.pwconv2                  1024x4096         3.246633 0.995530
+vocoder.model.backbone.convnext.27.pwconv2                  1024x4096         3.041756 0.995645
+vocoder.model.backbone.convnext.28.pwconv2                  1024x4096         3.000465 0.995606
+vocoder.model.backbone.convnext.29.pwconv1                  4096x1024         2.977924 0.995577
+vocoder.model.backbone.convnext.26.pwconv2                  1024x4096         2.842504 0.995639
+vocoder.model.backbone.convnext.23.pwconv1                  4096x1024         2.740351 0.995523
+
+Worst 10 layers by cosine similarity (lowest first):
+Name                                                        Shape               Cos   RelRMSE
+-----------------------------------------------------------------------------------------------
+cfm_decoder.model.diff_estimator.layers.19.input_layernorm.to_weight1024x1024      0.994238   9.6217%
+cfm_decoder.model.diff_estimator.layers.21.input_layernorm.to_weight1024x1024      0.994414   9.4232%
+cfm_decoder.model.diff_estimator.layers.20.input_layernorm.to_weight1024x1024      0.994526   9.6872%
+cfm_decoder.model.diff_estimator.layers.15.input_layernorm.to_weight1024x1024      0.994733   9.8244%
+cfm_decoder.model.diff_estimator.diff_step_mlp.0            4096x1024      0.994740   9.9593%
+cfm_decoder.model.diff_estimator.layers.21.post_attention_layernorm.to_weight1024x1024      0.994745   9.3264%
+cfm_decoder.model.diff_estimator.layers.14.input_layernorm.to_weight1024x1024      0.994810   9.7990%
+cfm_decoder.model.diff_estimator.layers.10.input_layernorm.to_weight1024x1024      0.994849   9.9599%
+cfm_decoder.model.diff_estimator.layers.13.input_layernorm.to_weight1024x1024      0.994850   9.7601%
+cfm_decoder.model.diff_estimator.layers.17.input_layernorm.to_weight1024x1024      0.994895   9.5157%
+
+Verdict:
+  Mean cosine similarity : 0.995413
+  Mean relative RMSE     : 9.4918%
+  Max abs error (any layer): 6.504849
+  Quantization grade     : GOOD
+  -> NVFP4 quantization is REAL (true 4-bit weight-only, native NVFP4 matmul on sm100+).

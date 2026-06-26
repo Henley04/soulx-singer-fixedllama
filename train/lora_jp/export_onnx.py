@@ -12,6 +12,9 @@ mismatch when switching languages.
 
 Other models (diff_step, vocoder, etc.) are NOT modified.
 
+Dequantization: if the checkpoint contains NVFP4 tensors (from true NVFP4
+fine-tuning), they are automatically dequantized to fp16 before export.
+
 Usage:
     python train/lora_jp/export_onnx.py \
         --checkpoint outputs/lora_jp/stage3/best.pt \
@@ -35,6 +38,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 JP_PHONEME_START = 3000
 JP_PHONEME_COUNT = 33  # jp_pau removed; 33 JP phonemes (jp_a..jp_cl)
 EMBED_DIM = 512
+
+
+def dequantize_nvfp4_tensor(tensor, target_dtype=torch.float16):
+    """Dequantize an NVFP4Tensor to fp16/fp32 if needed.
+
+    Returns the original tensor unchanged if it's not NVFP4.
+    """
+    if hasattr(tensor, 'dequantize') and 'NVFP4' in type(tensor).__name__:
+        return tensor.dequantize(target_dtype)
+    return tensor
+
+
+def dequantize_state_dict(sd, target_dtype=torch.float16):
+    """Dequantize all NVFP4 tensors in a state dict."""
+    return {k: dequantize_nvfp4_tensor(v, target_dtype)
+            if isinstance(v, torch.Tensor) else v
+            for k, v in sd.items()}
 
 
 class PreflowONNX(nn.Module):
@@ -100,6 +120,15 @@ def main():
     ft_ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     print(f'  Checkpoint keys: {list(ft_ckpt.keys())}')
     print(f'  Epoch: {ft_ckpt.get("epoch", "?")}, Phase: {ft_ckpt.get("phase", "?")}')
+
+    # Dequantize any NVFP4 tensors in checkpoint to fp16
+    for k, v in ft_ckpt.items():
+        if isinstance(v, dict):
+            ft_ckpt[k] = dequantize_state_dict(v, torch.float16)
+            n_dq = sum(1 for vv in ft_ckpt[k].values()
+                       if isinstance(vv, torch.Tensor) and vv.dtype == torch.float16)
+            if n_dq > 0:
+                print(f'  Dequantized {k} to fp16')
 
     # Load base model embedding for restoration
     print('Loading base model for embedding restoration...')

@@ -2,7 +2,7 @@
 Task 2: Embedding table initialization with scale calibration.
 
 Loads pretrained model, extends embedding to include JP phonemes,
-initializes them from dual-source (Chinese+English) mapping,
+initializes them from the English-source mapping,
 applies L2 normalization + global std matching.
 
 Usage:
@@ -66,7 +66,7 @@ def load_mapping(mapping_path):
 
 
 def initialize_jp_embeddings(embed_weight, mapping, phone2idx):
-    """Initialize JP phoneme embeddings from dual-source mapping.
+    """Initialize JP phoneme embeddings from the source mapping.
 
     Two-pass approach:
       Pass 1: Compute weighted sums for all phonemes, store temporarily.
@@ -255,7 +255,7 @@ def main():
     print(f"  Extended to: {base_embed.shape}")
 
     # Initialize JP embeddings from mapping
-    print("\nInitializing JP embeddings from dual-source mapping...")
+    print("\nInitializing JP embeddings from English-source mapping...")
     embed_weight, init_log = initialize_jp_embeddings(base_embed, mapping, phone2idx)
 
     # Count statuses

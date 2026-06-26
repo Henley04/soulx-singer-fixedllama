@@ -10,11 +10,7 @@
     "sources": [
       {
         "phone": "en_AA1",
-        "weight": 0.8
-      },
-      {
-        "phone": "zh_a1",
-        "weight": 0.2
+        "weight": 1.0
       }
     ]
   },
@@ -22,37 +18,25 @@
     "sources": [
       {
         "phone": "en_IY1",
-        "weight": 0.8
-      },
-      {
-        "phone": "zh_yi1",
-        "weight": 0.2
+        "weight": 1.0
       }
     ]
   },
   "jp_u": {
     "sources": [
       {
-        "phone": "zh_wu1",
-        "weight": 0.6
-      },
-      {
-        "phone": "en_UH1",
-        "weight": 0.4
+        "phone": "en_UW1",
+        "weight": 1.0
       }
     ],
     "init_weight": 0.5,
-    "note": "JP u is unrounded; weak match, reduced init weight"
+    "note": "JP u is high back unrounded; en_UW1 is high back rounded (closest tongue position). Reduced init weight."
   },
   "jp_e": {
     "sources": [
       {
         "phone": "en_EH1",
-        "weight": 0.8
-      },
-      {
-        "phone": "zh_e1",
-        "weight": 0.2
+        "weight": 1.0
       }
     ]
   },
@@ -60,11 +44,7 @@
     "sources": [
       {
         "phone": "en_OW1",
-        "weight": 0.8
-      },
-      {
-        "phone": "zh_o1",
-        "weight": 0.2
+        "weight": 1.0
       }
     ]
   },

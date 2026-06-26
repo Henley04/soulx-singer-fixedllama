@@ -6,6 +6,14 @@ Three-phase training:
   Phase 2 (Embed FT): Unfreeze embedding with lower LR (to epoch 40)
   Phase 3 (Joint): Full fine-tune with duration monitoring (to epoch 80)
 
+Precision: NVFP4 true quantization. The base model is PRE-QUANTIZED to
+NVIDIA FP4 (E2M1 + microscaling) via quantize_base_to_nvfp4.py (separate dir).
+train_staged.py loads this NVFP4 base model -- no in-place pseudo-quantization.
+The trainable preflow + JP embedding stay in high precision; cond_emb is
+dequantized to fp32 for training. Frozen diff_estimator stays NVFP4 for
+real compute speedup. Compute runs under bfloat16 autocast (no GradScaler).
+Requires Blackwell (sm100+) and torchao. Falls back to fp16 AMP (--no-nvfp4).
+
 The training objective is the actual cfm_decoder flow-matching loss (the same
 objective used at inference time via `reverse_diffusion`), NOT a proxy
 MelProjection MSE loss. This keeps the training objective aligned with
@@ -47,6 +55,104 @@ from train.lora_jp.dataset import JpLoRADataset, collate_fn
 JP_PHONEME_START = 3000
 JP_PHONEME_COUNT = 33  # jp_pau removed; jp_a..jp_cl now 33 phonemes
 EMBED_DIM = 512
+
+# NVFP4 true quantization: torchao import for loading pre-quantized base model.
+# The base model is quantized ONCE by quantize_base_to_nvfp4.py and saved to
+# a separate directory. train_staged.py loads it -- no in-place pseudo-quant.
+try:
+    from torchao.quantization import quantize_
+    from torchao.prototype.mx_formats import NVFP4WeightOnlyConfig
+    TORCHAO_NVFP4_AVAILABLE = True
+except ImportError:
+    TORCHAO_NVFP4_AVAILABLE = False
+
+
+def _nvfp4_linear_filter(mod, fqn):
+    """Filter: quantize ALL nn.Linear with dims divisible by 16.
+
+    At this point (before setup_phase), all params have requires_grad=True
+    so we can't use that as a filter. Instead we quantize ALL eligible Liners
+    and then dequantize the trainable ones (cond_emb) back to fp32 after
+    loading the NVFP4 weights.
+    """
+    if not isinstance(mod, nn.Linear):
+        return False
+    # Skip cond_emb (it's the only unfrozen Linear during training)
+    if 'cond_emb' in fqn:
+        return False
+    N, K = mod.weight.shape
+    return K % 16 == 0 and N % 16 == 0
+
+
+def dequantize_linear(linear_mod, target_dtype=torch.float32):
+    """Dequantize an NVFP4 Linear back to a regular fp32/fp16 Linear.
+
+    Used to restore cond_emb (trainable) to high precision after loading
+    the NVFP4 base model. The frozen diff_estimator stays NVFP4.
+    """
+    w = linear_mod.weight
+    if not (hasattr(w, 'dequantize') and 'NVFP4' in type(w).__name__):
+        return linear_mod  # already high precision
+    new_lin = nn.Linear(linear_mod.in_features, linear_mod.out_features,
+                        bias=linear_mod.bias is not None)
+    new_lin.weight.data = w.dequantize(target_dtype).to(new_lin.weight.device)
+    if linear_mod.bias is not None:
+        new_lin.bias.data = linear_mod.bias.data.clone()
+    return new_lin
+
+
+def load_nvfp4_base_weights(model, nvfp4_base_path, device):
+    """Load pre-quantized NVFP4 weights for diff_estimator from base model.
+
+    Directly assigns NVFP4Tensor weights to diff_estimator nn.Linear modules
+    (bypassing load_state_dict, which doesn't support copy_ for NVFP4Tensor).
+
+    Only the frozen cfm_decoder.model.diff_estimator keys are touched --
+    trainable layers (preflow, cond_emb, embedding) keep their current
+    fp32 values.
+    """
+    print(f"  Loading NVFP4 base: {nvfp4_base_path}")
+    nvfp4_ckpt = torch.load(nvfp4_base_path, map_location='cpu',
+                            weights_only=False)
+    nvfp4_sd = nvfp4_ckpt.get('state_dict', nvfp4_ckpt)
+
+    # Collect diff_estimator NVFP4 tensors by module path
+    de_prefix = 'cfm_decoder.model.diff_estimator.'
+    de_sd = {k: v for k, v in nvfp4_sd.items() if k.startswith(de_prefix)}
+    if not de_sd:
+        print("  WARNING: no diff_estimator keys found in NVFP4 base!")
+        return model
+
+    n_nvfp4 = 0
+    for full_key, nvfp4_tensor in de_sd.items():
+        # Extract local key within diff_estimator, e.g. 'layers.0.self_attn.q_proj.weight'
+        local_key = full_key[len(de_prefix):]
+
+        # Get the sub-module path (without '.weight' or '.bias')
+        parts = local_key.split('.')
+        if parts[-1] == 'weight':
+            attr_path = '.'.join(parts[:-1])
+            try:
+                target_mod = model.cfm_decoder.model.diff_estimator.get_submodule(attr_path)
+            except AttributeError:
+                continue
+            if hasattr(target_mod, 'weight'):
+                # Directly assign NVFP4Tensor as the parameter
+                target_mod.weight = torch.nn.Parameter(nvfp4_tensor.to(device=device))
+                n_nvfp4 += 1
+        elif parts[-1] == 'bias':
+            # Bias is not NVFP4-quantized; skip or use directly
+            attr_path = '.'.join(parts[:-1])
+            try:
+                target_mod = model.cfm_decoder.model.diff_estimator.get_submodule(attr_path)
+            except AttributeError:
+                continue
+            if hasattr(target_mod, 'bias') and target_mod.bias is not None:
+                target_mod.bias.data = nvfp4_tensor.data.to(
+                    device=target_mod.bias.device, dtype=target_mod.bias.dtype)
+
+    print(f"  Loaded {n_nvfp4} NVFP4 Linear weight(s) into diff_estimator")
+    return model
 
 # Phase configs
 PHASE_CONFIGS = {
@@ -106,6 +212,8 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_pa
         print(f"  Loading init embeddings from: {init_embed_path}")
         init_data = torch.load(init_embed_path, map_location='cpu', weights_only=False)
         embed_weight = init_data['embed_weight']
+        target_device = model.note_text_encoder.weight.device
+        embed_weight = embed_weight.to(target_device)
         if embed_weight.shape[0] > model.note_text_encoder.weight.shape[0]:
             new_emb = nn.Embedding(embed_weight.shape[0], EMBED_DIM)
             new_emb.weight.data = embed_weight
@@ -125,6 +233,7 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_pa
         # Restore embedding
         if 'embed_state_dict' in ckpt:
             ft_weight = ckpt['embed_state_dict']['weight']
+            ft_weight = ft_weight.to(model.note_text_encoder.weight.device)
             if ft_weight.shape[0] > model.note_text_encoder.weight.shape[0]:
                 new_emb = nn.Embedding(ft_weight.shape[0], EMBED_DIM)
                 new_emb.weight.data = ft_weight
@@ -135,6 +244,7 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_pa
         # Restore pitch encoder
         if 'pitch_encoder_state_dict' in ckpt:
             pe_weight = ckpt['pitch_encoder_state_dict']['weight']
+            pe_weight = pe_weight.to(model.note_pitch_encoder.weight.device)
             model.note_pitch_encoder.weight.data[:pe_weight.shape[0]] = pe_weight
 
         # Restore cond_emb (Linear(512, 1024) inside cfm_decoder that projects
@@ -142,8 +252,12 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_pa
         # Note: old checkpoints produced by the MelProjection variant do not
         # contain this key; that's fine — we just skip restoration.
         if 'cond_emb_state_dict' in ckpt:
-            model.cfm_decoder.model.cond_emb.load_state_dict(
-                ckpt['cond_emb_state_dict'])
+            ce_sd = ckpt['cond_emb_state_dict']
+            # Dequantize NVFP4 tensors if present (backward compat)
+            for k, v in ce_sd.items():
+                if hasattr(v, 'dequantize') and 'NVFP4' in type(v).__name__:
+                    ce_sd[k] = v.dequantize(torch.float32)
+            model.cfm_decoder.model.cond_emb.load_state_dict(ce_sd)
             print("  Restored cond_emb from checkpoint")
 
         ckpt_info["epoch_start"] = ckpt.get("epoch", 0) + 1
@@ -219,7 +333,8 @@ def build_optimizer(model, phase, base_lr):
 
 
 def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, writer,
-                    phase=1, use_amp=True, jp_to_en_indices=None):
+                    phase=1, use_amp=True, jp_to_en_indices=None,
+                    amp_dtype=torch.bfloat16):
     model.train()
     total_loss = 0
     total_recon = 0
@@ -237,7 +352,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, device, epoch, writer,
 
         optimizer.zero_grad()
         try:
-            with torch.amp.autocast('cuda', enabled=use_cuda_amp):
+            with torch.amp.autocast('cuda', enabled=use_cuda_amp, dtype=amp_dtype):
                 note_text = batch['phoneme'].to(device)
                 note_pitch = batch['note_pitch'].to(device)
                 note_type = batch['note_type'].to(device)
@@ -364,7 +479,7 @@ def compute_jp_en_cosine_stats(model, jp_to_en_indices):
 
 
 @torch.no_grad()
-def validate(model, dataloader, device, epoch, writer):
+def validate(model, dataloader, device, epoch, writer, amp_dtype=torch.bfloat16):
     model.eval()
     total_loss = 0
     n = 0
@@ -387,27 +502,29 @@ def validate(model, dataloader, device, epoch, writer):
                 f0 = f0.to(device)
             waveform = waveform.to(device)
 
-            features = (model.note_text_encoder(note_text) +
-                        model.note_pitch_encoder(note_pitch) +
-                        model.note_type_encoder(note_type))
-            features = model.preflow(features)
-            mel_feat = model.expand_states(features, mel2note)
+            with torch.amp.autocast('cuda', enabled=device.startswith('cuda'),
+                                    dtype=amp_dtype):
+                features = (model.note_text_encoder(note_text) +
+                            model.note_pitch_encoder(note_pitch) +
+                            model.note_type_encoder(note_type))
+                features = model.preflow(features)
+                mel_feat = model.expand_states(features, mel2note)
 
-            if f0 is not None and f0.shape[1] > 0:
-                f0_coarse = model.f0_to_coarse(f0)
-                mel_feat = mel_feat + model.f0_encoder(f0_coarse)[:, :mel_feat.shape[1], :]
+                if f0 is not None and f0.shape[1] > 0:
+                    f0_coarse = model.f0_to_coarse(f0)
+                    mel_feat = mel_feat + model.f0_encoder(f0_coarse)[:, :mel_feat.shape[1], :]
 
-            target_mel = model.mel(waveform.float())  # (B, T_mel, 128)
+                target_mel = model.mel(waveform.float())  # (B, T_mel, 128)
 
-            T = min(target_mel.shape[1], mel_feat.shape[1])
-            target_mel = target_mel[:, :T, :]
-            mel_feat = mel_feat[:, :T, :]
+                T = min(target_mel.shape[1], mel_feat.shape[1])
+                target_mel = target_mel[:, :T, :]
+                mel_feat = mel_feat[:, :T, :]
 
-            x_mask = (torch.arange(T, device=device).unsqueeze(0)
-                      < mel_lens.unsqueeze(1).clamp(max=T)).float()  # (B, T)
+                x_mask = (torch.arange(T, device=device).unsqueeze(0)
+                          < mel_lens.unsqueeze(1).clamp(max=T)).float()  # (B, T)
 
-            noise, x, flow_pred, final_mask, prompt_len = model.cfm_decoder(
-                target_mel, x_mask, mel_feat, is_prompt=None)
+                noise, x, flow_pred, final_mask, prompt_len = model.cfm_decoder(
+                    target_mel, x_mask, mel_feat, is_prompt=None)
 
             sigma = model.cfm_decoder.model.sigma
             flow_target = x - (1 - sigma) * noise
@@ -494,6 +611,12 @@ def main():
     parser.add_argument('--val_ratio', type=float, default=0.1,
                         help='Fraction of dataset to use for validation')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for train/val split')
+    parser.add_argument('--nvfp4', action='store_true', default=True,
+                        help='Load pre-quantized NVFP4 base model (default)')
+    parser.add_argument('--no-nvfp4', dest='nvfp4', action='store_false',
+                        help='Disable NVFP4, use fp16 AMP instead')
+    parser.add_argument('--nvfp4_base', default='pretrained_models/SoulX-Singer-nvfp4/model.pt',
+                        help='Path to pre-quantized NVFP4 base model')
     args = parser.parse_args()
 
     # Validate device
@@ -521,11 +644,38 @@ def main():
             jp_to_en_indices[jp_offset] = phone2idx[en_name]
     print(f"  JP->EN decoupling map: {len(jp_to_en_indices)} entries")
 
+    # Determine precision: NVFP4 true quant (bf16 autocast, no GradScaler) or fp16 AMP.
+    use_cuda_amp = args.device.startswith('cuda')
+    use_nvfp4 = (args.nvfp4 and use_cuda_amp and TORCHAO_NVFP4_AVAILABLE
+                 and torch.cuda.get_device_capability()[0] >= 10)
+    amp_dtype = torch.bfloat16 if use_nvfp4 else torch.float16
+    if use_nvfp4:
+        print("[Precision] NVFP4 true quant: pre-quantized base, bf16 autocast")
+    else:
+        print("[Precision] fp16 AMP (NVFP4 disabled or unavailable)")
+
     # Load base model
     print(f'[Phase {args.phase}] Loading base model...')
     model = SoulXSinger(config)
     ckpt = torch.load(args.model_path, map_location='cpu', weights_only=False)
     model.load_state_dict(ckpt.get('state_dict', ckpt), strict=True)
+
+    # Move to device BEFORE NVFP4 quantization (NVFP4 requires CUDA)
+    model = model.to(args.device)
+
+    # NVFP4 true quantization: load pre-quantized NVFP4 base model.
+    # Step 1: apply quantize_ to create NVFP4 Linear structure (uses current
+    #         fp32 weights; the actual NVFP4 values are overwritten in step 2).
+    # Step 2: load NVFP4 state dict for diff_estimator only (frozen layers).
+    # Step 3: dequantize cond_emb back to fp32 (it's trainable).
+    if use_nvfp4:
+        if not os.path.exists(args.nvfp4_base):
+            raise FileNotFoundError(
+                f"NVFP4 base model not found: {args.nvfp4_base}\n"
+                f"Run: python train/lora_jp/quantize_base_to_nvfp4.py")
+        # Load pre-quantized NVFP4 weights directly (no quantize_() call).
+        load_nvfp4_base_weights(model, args.nvfp4_base, args.device)
+        # cond_emb stays in fp32 (not in NVFP4 state dict).
 
     # Setup phase (also handles resume, including cond_emb restoration).
     # setup_phase freezes everything, then unfreezes preflow + cond_emb
@@ -537,20 +687,16 @@ def main():
     epoch_start = ckpt_info.get("epoch_start", 1)
 
     # vocoder is never used in training — keep it frozen to save VRAM.
-    # (cfm_decoder freezing is already handled by setup_phase, which leaves
-    # cond_emb trainable and diff_estimator frozen.)
     for param in model.vocoder.parameters():
         param.requires_grad = False
 
-    # Move model to device BEFORE building optimizer
-    model = model.to(args.device)
-
-    # Optimizer (after model is on device, so optimizer states are on GPU from the start)
+    # Optimizer (after model is on device, so optimizer states are on GPU from the start).
+    # Only trainable params are included; quantized frozen weights are excluded.
     optimizer = build_optimizer(model, args.phase, args.lr)
 
-    # GradScaler for AMP (persists across epochs to adapt scale factor)
-    use_cuda_amp = args.device.startswith('cuda')
-    scaler = torch.amp.GradScaler('cuda', enabled=use_cuda_amp)
+    # GradScaler: bf16 (NVFP4) has fp32-equivalent exponent range and needs no
+    # scaling; fp16 AMP does. GradScaler(enabled=False) is a no-op passthrough.
+    scaler = torch.amp.GradScaler('cuda', enabled=use_cuda_amp and not use_nvfp4)
 
     # Scheduler
     steps_per_epoch = 50  # approximate
@@ -589,7 +735,8 @@ def main():
         t0 = time.time()
         avg_loss = train_one_epoch(model, train_dataloader, optimizer, scaler,
                                    args.device, epoch, writer, phase=args.phase,
-                                   jp_to_en_indices=jp_to_en_indices)
+                                   jp_to_en_indices=jp_to_en_indices,
+                                   amp_dtype=amp_dtype)
         elapsed = time.time() - t0
         print(f'Epoch {epoch}/{total_epochs} loss={avg_loss:.4f} time={elapsed:.1f}s')
 
@@ -609,7 +756,8 @@ def main():
 
         # Validation (uses separate val_dataset, not training set)
         if epoch % args.eval_every == 0:
-            val_loss = validate(model, val_dataloader, args.device, epoch, writer)
+            val_loss = validate(model, val_dataloader, args.device, epoch, writer,
+                                 amp_dtype=amp_dtype)
             print(f'  val_loss={val_loss:.4f}')
 
             if val_loss < best_loss:

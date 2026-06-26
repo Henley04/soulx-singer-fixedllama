@@ -1,9 +1,9 @@
 """
-Task 1: Generate dual-source phoneme mapping config.
+Task 1: Generate English-source phoneme mapping config.
 
 Design principles:
   - Pure consonants (en_K, en_S, etc.): 1.0 weight — exact match.
-  - Vowels: English 0.8 + Chinese 0.2 — close match, small Chinese correction.
+  - Vowels: English-only sources (Chinese phonemes removed from initialization).
   - Composites (jp_r, jp_ts, jp_u, jp_ry): lower init weight or skip entirely
     when no source phoneme is close enough (cos_sim < 0.6).
   - jp_pau/jp_cl: pause mean (silence, no phonetic content needed).
@@ -29,39 +29,36 @@ MAPPING = {
         "noise_std": 0.01
     },
 
-    # ── Vowels (English primary + Chinese secondary) ──────────────────
+    # ── Vowels (English-only sources; Chinese phonemes removed) ─────
     "jp_a": {
         "sources": [
-            {"phone": "en_AA1", "weight": 0.8},
-            {"phone": "zh_a1",  "weight": 0.2}
+            {"phone": "en_AA1", "weight": 1.0}
         ]
     },
     "jp_i": {
         "sources": [
-            {"phone": "en_IY1", "weight": 0.8},
-            {"phone": "zh_yi1", "weight": 0.2}
+            {"phone": "en_IY1", "weight": 1.0}
         ]
     },
-    # JP /ɯ/ = unrounded back vowel — no close English match
-    # Use Chinese wu (closest) as primary, English UH as secondary
+    # JP /ɯ/ = high back unrounded — no exact English match.
+    # en_UW1 (/u/) is high back rounded: matches tongue position,
+    # differs only in lip rounding. Reduced init_weight lets the model
+    # learn the unrounded quality from data.
     "jp_u": {
         "sources": [
-            {"phone": "zh_wu1", "weight": 0.6},
-            {"phone": "en_UH1", "weight": 0.4}
+            {"phone": "en_UW1", "weight": 1.0}
         ],
         "init_weight": 0.5,
-        "note": "JP u is unrounded; weak match, reduced init weight"
+        "note": "JP u is high back unrounded; en_UW1 is high back rounded (closest tongue position). Reduced init weight."
     },
     "jp_e": {
         "sources": [
-            {"phone": "en_EH1", "weight": 0.8},
-            {"phone": "zh_e1",  "weight": 0.2}
+            {"phone": "en_EH1", "weight": 1.0}
         ]
     },
     "jp_o": {
         "sources": [
-            {"phone": "en_OW1", "weight": 0.8},
-            {"phone": "zh_o1",  "weight": 0.2}
+            {"phone": "en_OW1", "weight": 1.0}
         ]
     },
 
