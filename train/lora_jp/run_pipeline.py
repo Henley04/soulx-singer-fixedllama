@@ -23,6 +23,7 @@ CONFIG = "soulxsinger/config/soulxsinger.yaml"
 PHONESET = "train/lora_jp/jp_phone_set.json"
 METADATA = "train/lora_jp/dataset/metadata.json"
 WAV_DIR = "train/lora_jp/dataset/wavs"
+ONNX_JP_DIR = os.path.join(PROJECT_DIR, '..', 'onnx_models', 'fp16', 'JP')
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 log_fh = open(LOG_FILE, 'w', encoding='utf-8')
@@ -57,15 +58,21 @@ def main():
     log("Japanese TTS Pipeline: Starting")
     log("="*60)
 
-    # Step 1: Generate phoneme mapping
+    # Step 1: Prepare dataset (PJS Corpus -> metadata.json + wavs/)
     run_step(
-        "[Step 1/8] Generating phoneme mapping",
+        "[Step 1/9] Preparing dataset (PJS Corpus -> metadata + wavs)",
+        [sys.executable, "train/lora_jp/prepare_dataset.py"]
+    )
+
+    # Step 2: Generate phoneme mapping
+    run_step(
+        "[Step 2/9] Generating phoneme mapping",
         [sys.executable, "train/lora_jp/phoneme_mapping.py"]
     )
 
-    # Step 2: Initialize embeddings
+    # Step 3: Initialize embeddings
     run_step(
-        "[Step 2/8] Initializing embeddings",
+        "[Step 3/9] Initializing embeddings",
         [sys.executable, "train/lora_jp/init_embeddings.py",
          "--model_path", MODEL_PATH,
          "--mapping", "train/lora_jp/jp_phoneme_mapping.json",
@@ -74,9 +81,9 @@ def main():
          "--target_std", "0.9"]
     )
 
-    # Step 3: Phase 1 training
+    # Step 4: Phase 1 training
     run_step(
-        "[Step 3/8] Phase 1: Warmup & Adaptation (frozen embedding)",
+        "[Step 4/9] Phase 1: Warmup & Adaptation (frozen embedding)",
         [sys.executable, "train/lora_jp/train_staged.py",
          "--phase", "1",
          "--model_path", MODEL_PATH,
@@ -91,9 +98,9 @@ def main():
          "--device", "cuda"]
     )
 
-    # Step 4: Validate Phase 1
+    # Step 5: Validate Phase 1
     run_step(
-        "[Step 4/8] Validating Phase 1",
+        "[Step 5/9] Validating Phase 1",
         [sys.executable, "train/lora_jp/validate_and_rollback.py",
          "--checkpoint", f"{OUTPUT_DIR}/stage1/best.pt",
          "--model_path", MODEL_PATH,
@@ -106,9 +113,9 @@ def main():
     )
     _check_rollback("Phase 1")
 
-    # Step 5: Phase 2 training
+    # Step 6: Phase 2 training
     run_step(
-        "[Step 5/8] Phase 2: Embedding Fine-tuning",
+        "[Step 6/9] Phase 2: Embedding Fine-tuning",
         [sys.executable, "train/lora_jp/train_staged.py",
          "--phase", "2",
          "--model_path", MODEL_PATH,
@@ -123,9 +130,9 @@ def main():
          "--device", "cuda"]
     )
 
-    # Step 6: Validate Phase 2
+    # Step 7: Validate Phase 2
     run_step(
-        "[Step 6/8] Validating Phase 2",
+        "[Step 7/9] Validating Phase 2",
         [sys.executable, "train/lora_jp/validate_and_rollback.py",
          "--checkpoint", f"{OUTPUT_DIR}/stage2/best.pt",
          "--model_path", MODEL_PATH,
@@ -138,9 +145,9 @@ def main():
     )
     _check_rollback("Phase 2")
 
-    # Step 7: Phase 3 training
+    # Step 8: Phase 3 training
     run_step(
-        "[Step 7/8] Phase 3: Joint Fine-tuning",
+        "[Step 8/9] Phase 3: Joint Fine-tuning",
         [sys.executable, "train/lora_jp/train_staged.py",
          "--phase", "3",
          "--model_path", MODEL_PATH,
@@ -155,9 +162,9 @@ def main():
          "--device", "cuda"]
     )
 
-    # Step 8: Final validation + synthesis
+    # Step 9: Final validation + synthesis + ONNX export
     run_step(
-        "[Step 8/8] Final validation + synthesis check",
+        "[Step 9/9] Final validation + synthesis check",
         [sys.executable, "train/lora_jp/validate_and_rollback.py",
          "--checkpoint", f"{OUTPUT_DIR}/stage3/best.pt",
          "--model_path", MODEL_PATH,
@@ -170,12 +177,21 @@ def main():
          "--synthesize"]
     )
 
+    run_step(
+        "[Step 9/9] Exporting ONNX models (note_text_encoder + preflow + cond_emb)",
+        [sys.executable, "train/lora_jp/export_onnx.py",
+         "--checkpoint", f"{OUTPUT_DIR}/stage3/best.pt",
+         "--base_model", MODEL_PATH,
+         "--output_dir", ONNX_JP_DIR]
+    )
+
     log("")
     log("="*60)
     log("Pipeline complete!")
     log(f"  Checkpoints: {OUTPUT_DIR}/stage1/best.pt, stage2/best.pt, stage3/best.pt")
     log(f"  Validation:  {OUTPUT_DIR}/validation_results.json")
     log(f"  Synthesis:   {OUTPUT_DIR}/synthesis_check/")
+    log(f"  ONNX models: {ONNX_JP_DIR}")
     log(f"  TensorBoard: tensorboard --logdir {OUTPUT_DIR}")
     log(f"  Full log:    {LOG_FILE}")
     log("="*60)
