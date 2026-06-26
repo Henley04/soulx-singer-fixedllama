@@ -337,7 +337,13 @@ class DiffLlama(LlamaModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        all_layer_hidden_states = []
+        # Only collect per-layer hidden states when the caller actually needs
+        # them (repa/ctc). JP LoRA training never uses repa/ctc, so we skip
+        # the 22x .clone() to save memory and time.
+        use_repa = getattr(self, 'use_repa', False)
+        use_ctc = getattr(self, 'use_ctc', False)
+        need_layer_hidden = return_dict and (use_repa or use_ctc)
+        all_layer_hidden_states = [] if need_layer_hidden else None
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -348,21 +354,22 @@ class DiffLlama(LlamaModel):
             )
 
             if self.gradient_checkpointing and self.training:
-                raise NotImplementedError
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        # None for past_key_value
-                        return module(*inputs, output_attentions, None)
-
-                    return custom_forward
-
+                # use_reentrant=False supports keyword arguments (cond_embedding,
+                # position_embeddings, etc.) that the reentrant variant does not.
+                # This trades ~20% extra forward compute for large activation
+                # memory savings across the 22 DiffLlama layers, enabling larger
+                # batch sizes during fine-tuning.
                 layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(decoder_layer),
+                    decoder_layer,
                     hidden_states,
-                    attention_mask,
-                    position_ids,
-                    None,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cond_embedding=diffusion_step,
+                    position_embeddings=position_embeddings,
+                    use_reentrant=False,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -377,7 +384,8 @@ class DiffLlama(LlamaModel):
                 )
 
             hidden_states = layer_outputs[0]
-            all_layer_hidden_states.append(hidden_states.clone())
+            if need_layer_hidden:
+                all_layer_hidden_states.append(hidden_states)
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
@@ -406,7 +414,7 @@ class DiffLlama(LlamaModel):
         if return_dict:
             return {
                 "output": hidden_states,
-                "hidden_states": all_layer_hidden_states,
+                "hidden_states": all_layer_hidden_states if all_layer_hidden_states is not None else [],
             }
 
         return hidden_states

@@ -7,9 +7,11 @@
 | 指标 | 值 |
 |------|-----|
 | 数据集 | PJS Corpus (100首歌，~15分钟) |
-| 可训练参数 | ~4.25M (preflow + JP embedding + pitch_encoder) |
+| 可训练参数 | ~4.25M (preflow + JP embedding + cond_emb) |
 | 训练阶段 | 三阶段 (warmup → embed FT → joint) |
-| GPU | RTX 5060 8GB (AMP) |
+| GPU | RTX 5060 8GB (bf16 autocast + gradient checkpointing) |
+| 精度 | bfloat16 autocast (无量化，无精度损失) |
+| batch_size | 4 (gradient checkpointing 省显存) |
 
 ## 文件结构
 
@@ -138,6 +140,31 @@ python train/lora_jp/export_onnx.py \
 4. **ONNX 导出时不导出 pitch_encoder** — 复用 base 模型，微调结果会被丢弃
 
 因此日语推理时即使用户输入 MIDI 84+（训练集外），base 模型的 pitch_encoder 也能提供合理表征。
+
+## 训练优化
+
+### 移除 NVFP4，改用 bf16 autocast
+
+早期版本使用 NVFP4 weight-only 量化加速训练，但实际测试发现：
+
+1. **加速有限**：NVFP4 只加速 forward matmul，微调时主要瓶颈在 backward dgrad（对 input 的梯度），NVFP4 dgrad 内核效率低
+2. **精度损失**：276 层平均 cosine 0.9954，相对 RMSE 9.5%，影响梯度信号质量
+
+改用 bf16 autocast 后：
+- forward 和 backward 都有原生 bf16 内核（无精度损失）
+- bf16 指数范围与 fp32 相同，无需 GradScaler
+- 实际训练速度与 NVFP4 相当或更快（backward 加速弥补 forward 差距）
+
+### Gradient Checkpointing
+
+22 层 DiffLlama (diff_estimator) 启用 `gradient_checkpointing`：
+- 用 `use_reentrant=False` 模式支持 `cond_embedding` kwargs（旧版 reentrant 不支持）
+- 以 ~20% 额外 forward 计算换取大幅激活显存节省
+- 使 batch_size 从 1 提升到 4，提高 GPU 利用率
+
+### Hidden States 按需保存
+
+原 DiffLlama 每层都 `clone()` 保存 hidden_states（供 repa/ctc 使用），但 JP LoRA 不用 repa/ctc。改为只在 `use_repa` 或 `use_ctc` 为 True 时才保存，省去 22 次 clone 的内存和时间开销。
 
 ## 自定义训练
 

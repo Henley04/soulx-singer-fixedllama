@@ -6,13 +6,16 @@ Three-phase training:
   Phase 2 (Embed FT): Unfreeze embedding with lower LR (to epoch 40)
   Phase 3 (Joint): Full fine-tune with duration monitoring (to epoch 80)
 
-Precision: NVFP4 true quantization. The base model is PRE-QUANTIZED to
-NVIDIA FP4 (E2M1 + microscaling) via quantize_base_to_nvfp4.py (separate dir).
-train_staged.py loads this NVFP4 base model -- no in-place pseudo-quantization.
-The trainable preflow + JP embedding stay in high precision; cond_emb is
-dequantized to fp32 for training. Frozen diff_estimator stays NVFP4 for
-real compute speedup. Compute runs under bfloat16 autocast (no GradScaler).
-Requires Blackwell (sm100+) and torchao. Falls back to fp16 AMP (--no-nvfp4).
+Precision: bfloat16 autocast (no NVFP4). NVFP4 weight-only quantization was
+removed because (a) it only accelerates forward matmul, not backward dgrad,
+so the training speedup was marginal, and (b) it introduced ~9.5% relative
+RMSE precision loss that degraded gradient signal quality. With bf16 autocast,
+both forward and backward run at full bf16 precision with native kernels —
+no GradScaler needed (bf16 has fp32-equivalent exponent range).
+
+Gradient checkpointing is enabled on the 22-layer DiffLlama (diff_estimator)
+to trade ~20% extra forward compute for large activation-memory savings,
+enabling larger batch sizes.
 
 The training objective is the actual cfm_decoder flow-matching loss (the same
 objective used at inference time via `reverse_diffusion`), NOT a proxy
@@ -55,104 +58,6 @@ from train.lora_jp.dataset import JpLoRADataset, collate_fn
 JP_PHONEME_START = 3000
 JP_PHONEME_COUNT = 33  # jp_pau removed; jp_a..jp_cl now 33 phonemes
 EMBED_DIM = 512
-
-# NVFP4 true quantization: torchao import for loading pre-quantized base model.
-# The base model is quantized ONCE by quantize_base_to_nvfp4.py and saved to
-# a separate directory. train_staged.py loads it -- no in-place pseudo-quant.
-try:
-    from torchao.quantization import quantize_
-    from torchao.prototype.mx_formats import NVFP4WeightOnlyConfig
-    TORCHAO_NVFP4_AVAILABLE = True
-except ImportError:
-    TORCHAO_NVFP4_AVAILABLE = False
-
-
-def _nvfp4_linear_filter(mod, fqn):
-    """Filter: quantize ALL nn.Linear with dims divisible by 16.
-
-    At this point (before setup_phase), all params have requires_grad=True
-    so we can't use that as a filter. Instead we quantize ALL eligible Liners
-    and then dequantize the trainable ones (cond_emb) back to fp32 after
-    loading the NVFP4 weights.
-    """
-    if not isinstance(mod, nn.Linear):
-        return False
-    # Skip cond_emb (it's the only unfrozen Linear during training)
-    if 'cond_emb' in fqn:
-        return False
-    N, K = mod.weight.shape
-    return K % 16 == 0 and N % 16 == 0
-
-
-def dequantize_linear(linear_mod, target_dtype=torch.float32):
-    """Dequantize an NVFP4 Linear back to a regular fp32/fp16 Linear.
-
-    Used to restore cond_emb (trainable) to high precision after loading
-    the NVFP4 base model. The frozen diff_estimator stays NVFP4.
-    """
-    w = linear_mod.weight
-    if not (hasattr(w, 'dequantize') and 'NVFP4' in type(w).__name__):
-        return linear_mod  # already high precision
-    new_lin = nn.Linear(linear_mod.in_features, linear_mod.out_features,
-                        bias=linear_mod.bias is not None)
-    new_lin.weight.data = w.dequantize(target_dtype).to(new_lin.weight.device)
-    if linear_mod.bias is not None:
-        new_lin.bias.data = linear_mod.bias.data.clone()
-    return new_lin
-
-
-def load_nvfp4_base_weights(model, nvfp4_base_path, device):
-    """Load pre-quantized NVFP4 weights for diff_estimator from base model.
-
-    Directly assigns NVFP4Tensor weights to diff_estimator nn.Linear modules
-    (bypassing load_state_dict, which doesn't support copy_ for NVFP4Tensor).
-
-    Only the frozen cfm_decoder.model.diff_estimator keys are touched --
-    trainable layers (preflow, cond_emb, embedding) keep their current
-    fp32 values.
-    """
-    print(f"  Loading NVFP4 base: {nvfp4_base_path}")
-    nvfp4_ckpt = torch.load(nvfp4_base_path, map_location='cpu',
-                            weights_only=False)
-    nvfp4_sd = nvfp4_ckpt.get('state_dict', nvfp4_ckpt)
-
-    # Collect diff_estimator NVFP4 tensors by module path
-    de_prefix = 'cfm_decoder.model.diff_estimator.'
-    de_sd = {k: v for k, v in nvfp4_sd.items() if k.startswith(de_prefix)}
-    if not de_sd:
-        print("  WARNING: no diff_estimator keys found in NVFP4 base!")
-        return model
-
-    n_nvfp4 = 0
-    for full_key, nvfp4_tensor in de_sd.items():
-        # Extract local key within diff_estimator, e.g. 'layers.0.self_attn.q_proj.weight'
-        local_key = full_key[len(de_prefix):]
-
-        # Get the sub-module path (without '.weight' or '.bias')
-        parts = local_key.split('.')
-        if parts[-1] == 'weight':
-            attr_path = '.'.join(parts[:-1])
-            try:
-                target_mod = model.cfm_decoder.model.diff_estimator.get_submodule(attr_path)
-            except AttributeError:
-                continue
-            if hasattr(target_mod, 'weight'):
-                # Directly assign NVFP4Tensor as the parameter
-                target_mod.weight = torch.nn.Parameter(nvfp4_tensor.to(device=device))
-                n_nvfp4 += 1
-        elif parts[-1] == 'bias':
-            # Bias is not NVFP4-quantized; skip or use directly
-            attr_path = '.'.join(parts[:-1])
-            try:
-                target_mod = model.cfm_decoder.model.diff_estimator.get_submodule(attr_path)
-            except AttributeError:
-                continue
-            if hasattr(target_mod, 'bias') and target_mod.bias is not None:
-                target_mod.bias.data = nvfp4_tensor.data.to(
-                    device=target_mod.bias.device, dtype=target_mod.bias.dtype)
-
-    print(f"  Loaded {n_nvfp4} NVFP4 Linear weight(s) into diff_estimator")
-    return model
 
 # Phase configs
 PHASE_CONFIGS = {
@@ -252,12 +157,7 @@ def setup_phase(model, phase, init_embed_path=None, resume_path=None, mapping_pa
         # Note: old checkpoints produced by the MelProjection variant do not
         # contain this key; that's fine — we just skip restoration.
         if 'cond_emb_state_dict' in ckpt:
-            ce_sd = ckpt['cond_emb_state_dict']
-            # Dequantize NVFP4 tensors if present (backward compat)
-            for k, v in ce_sd.items():
-                if hasattr(v, 'dequantize') and 'NVFP4' in type(v).__name__:
-                    ce_sd[k] = v.dequantize(torch.float32)
-            model.cfm_decoder.model.cond_emb.load_state_dict(ce_sd)
+            model.cfm_decoder.model.cond_emb.load_state_dict(ckpt['cond_emb_state_dict'])
             print("  Restored cond_emb from checkpoint")
 
         ckpt_info["epoch_start"] = ckpt.get("epoch", 0) + 1
@@ -601,7 +501,7 @@ def main():
     parser.add_argument('--output_dir', default='outputs/lora_jp')
     parser.add_argument('--init_embed', default=None, help='Path to init_embed.pt for Phase 1')
     parser.add_argument('--resume', default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--epochs', type=int, default=None, help='Override phase epoch count')
     parser.add_argument('--save_every', type=int, default=5)
@@ -611,12 +511,10 @@ def main():
     parser.add_argument('--val_ratio', type=float, default=0.1,
                         help='Fraction of dataset to use for validation')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for train/val split')
-    parser.add_argument('--nvfp4', action='store_true', default=True,
-                        help='Load pre-quantized NVFP4 base model (default)')
-    parser.add_argument('--no-nvfp4', dest='nvfp4', action='store_false',
-                        help='Disable NVFP4, use fp16 AMP instead')
-    parser.add_argument('--nvfp4_base', default='pretrained_models/SoulX-Singer-nvfp4/model.pt',
-                        help='Path to pre-quantized NVFP4 base model')
+    parser.add_argument('--grad_checkpoint', action='store_true', default=True,
+                        help='Enable gradient checkpointing on diff_estimator (default)')
+    parser.add_argument('--no-grad-checkpoint', dest='grad_checkpoint', action='store_false',
+                        help='Disable gradient checkpointing')
     args = parser.parse_args()
 
     # Validate device
@@ -644,15 +542,11 @@ def main():
             jp_to_en_indices[jp_offset] = phone2idx[en_name]
     print(f"  JP->EN decoupling map: {len(jp_to_en_indices)} entries")
 
-    # Determine precision: NVFP4 true quant (bf16 autocast, no GradScaler) or fp16 AMP.
+    # Determine precision: bf16 autocast (no NVFP4, no precision loss).
+    # bf16 has fp32-equivalent exponent range, so no GradScaler is needed.
     use_cuda_amp = args.device.startswith('cuda')
-    use_nvfp4 = (args.nvfp4 and use_cuda_amp and TORCHAO_NVFP4_AVAILABLE
-                 and torch.cuda.get_device_capability()[0] >= 10)
-    amp_dtype = torch.bfloat16 if use_nvfp4 else torch.float16
-    if use_nvfp4:
-        print("[Precision] NVFP4 true quant: pre-quantized base, bf16 autocast")
-    else:
-        print("[Precision] fp16 AMP (NVFP4 disabled or unavailable)")
+    amp_dtype = torch.bfloat16 if use_cuda_amp else torch.float32
+    print(f"[Precision] bf16 autocast (no NVFP4, no precision loss)")
 
     # Load base model
     print(f'[Phase {args.phase}] Loading base model...')
@@ -660,22 +554,17 @@ def main():
     ckpt = torch.load(args.model_path, map_location='cpu', weights_only=False)
     model.load_state_dict(ckpt.get('state_dict', ckpt), strict=True)
 
-    # Move to device BEFORE NVFP4 quantization (NVFP4 requires CUDA)
+    # Move to device
     model = model.to(args.device)
 
-    # NVFP4 true quantization: load pre-quantized NVFP4 base model.
-    # Step 1: apply quantize_ to create NVFP4 Linear structure (uses current
-    #         fp32 weights; the actual NVFP4 values are overwritten in step 2).
-    # Step 2: load NVFP4 state dict for diff_estimator only (frozen layers).
-    # Step 3: dequantize cond_emb back to fp32 (it's trainable).
-    if use_nvfp4:
-        if not os.path.exists(args.nvfp4_base):
-            raise FileNotFoundError(
-                f"NVFP4 base model not found: {args.nvfp4_base}\n"
-                f"Run: python train/lora_jp/quantize_base_to_nvfp4.py")
-        # Load pre-quantized NVFP4 weights directly (no quantize_() call).
-        load_nvfp4_base_weights(model, args.nvfp4_base, args.device)
-        # cond_emb stays in fp32 (not in NVFP4 state dict).
+    # Enable gradient checkpointing on the frozen 22-layer DiffLlama to save
+    # activation memory. This allows larger batch sizes during fine-tuning.
+    # use_reentrant=False in llama.py supports the cond_embedding kwarg.
+    if args.grad_checkpoint and hasattr(model.cfm_decoder.model.diff_estimator, 'gradient_checkpointing'):
+        model.cfm_decoder.model.diff_estimator.gradient_checkpointing = True
+        print("[GradCheckpoint] Enabled on diff_estimator (22 layers)")
+    else:
+        print("[GradCheckpoint] Disabled")
 
     # Setup phase (also handles resume, including cond_emb restoration).
     # setup_phase freezes everything, then unfreezes preflow + cond_emb
@@ -694,9 +583,9 @@ def main():
     # Only trainable params are included; quantized frozen weights are excluded.
     optimizer = build_optimizer(model, args.phase, args.lr)
 
-    # GradScaler: bf16 (NVFP4) has fp32-equivalent exponent range and needs no
-    # scaling; fp16 AMP does. GradScaler(enabled=False) is a no-op passthrough.
-    scaler = torch.amp.GradScaler('cuda', enabled=use_cuda_amp and not use_nvfp4)
+    # GradScaler: bf16 has fp32-equivalent exponent range, no scaling needed.
+    # GradScaler(enabled=False) is a no-op passthrough for loss.backward().
+    scaler = torch.amp.GradScaler('cuda', enabled=False)
 
     # Scheduler
     steps_per_epoch = 50  # approximate
