@@ -69,22 +69,23 @@ class JpLoRADataset(Dataset):
 
         # Build a deterministic sample_id -> wav_path mapping at __init__ time.
         # os.listdir order is not guaranteed across platforms/runs, so we sort
-        # and match by sample_id (the "id" field in metadata) when possible,
+        # and match by sample_id (the "id"/"index" field in metadata) when possible,
         # falling back to sorted index order for legacy metadata without ids.
+        # Supports both PJS ("pjs*") and JVS ("jvs*") wav prefixes.
         self.wav_path_map = {}
         if os.path.isdir(wav_dir):
             wav_files = sorted(
                 f for f in os.listdir(wav_dir)
-                if f.endswith('.wav') and f.startswith('pjs')
+                if f.endswith('.wav') and (f.startswith('pjs') or f.startswith('jvs'))
             )
-            # Try to match by sample_id (e.g., "pjs001" -> "pjs001.wav")
+            # Try to match by sample_id / index (e.g., "pjs001" -> "pjs001.wav")
             id_to_wav = {}
             for wf in wav_files:
                 stem = os.path.splitext(wf)[0]
                 id_to_wav[stem] = wf
 
             for i, meta in enumerate(self.metadata):
-                sid = meta.get("id") or meta.get("sample_id")
+                sid = meta.get("id") or meta.get("sample_id") or meta.get("index")
                 if sid and sid in id_to_wav:
                     self.wav_path_map[i] = os.path.join(wav_dir, id_to_wav[sid])
                 elif i < len(wav_files):

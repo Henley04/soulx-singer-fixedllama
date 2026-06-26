@@ -491,6 +491,10 @@ def main():
     parser.add_argument('--mapping_path', default='train/lora_jp/jp_phoneme_mapping.json')
     parser.add_argument('--dataset_metadata', default='train/lora_jp/dataset/metadata.json')
     parser.add_argument('--dataset_wav_dir', default='train/lora_jp/dataset/wavs')
+    parser.add_argument('--extra_dataset_metadata', default=None,
+                        help='Additional dataset metadata.json (e.g. JVS). If set, merged with primary.')
+    parser.add_argument('--extra_dataset_wav_dir', default=None,
+                        help='Wav dir for extra dataset. Required if --extra_dataset_metadata is set.')
     parser.add_argument('--output_dir', default='outputs/lora_jp')
     parser.add_argument('--init_embed', default=None, help='Path to init_embed.pt for Phase 1')
     parser.add_argument('--resume', default=None, help='Path to checkpoint to resume from')
@@ -599,6 +603,24 @@ def main():
         sample_rate=config.audio.sample_rate,
         hop_size=config.audio.hop_size,
     )
+
+    # Merge extra dataset (JVS) if provided
+    if args.extra_dataset_metadata:
+        if not args.extra_dataset_wav_dir:
+            print('WARNING: --extra_dataset_metadata set but --extra_dataset_wav_dir missing; skipping JVS.')
+        else:
+            print('[Phase {}] Loading extra dataset (JVS)...'.format(args.phase))
+            extra_dataset = JpLoRADataset(
+                metadata_path=args.extra_dataset_metadata,
+                wav_dir=args.extra_dataset_wav_dir,
+                phoneset_path=args.phoneset_path,
+                sample_rate=config.audio.sample_rate,
+                hop_size=config.audio.hop_size,
+            )
+            from torch.utils.data import ConcatDataset
+            full_dataset = ConcatDataset([full_dataset, extra_dataset])
+            print(f'[Phase {args.phase}] Merged dataset: {len(full_dataset)} samples')
+
     train_dataset, val_dataset = split_train_val(full_dataset, args.val_ratio, args.seed)
 
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,

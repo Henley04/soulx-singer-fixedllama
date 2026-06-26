@@ -23,6 +23,9 @@ CONFIG = "soulxsinger/config/soulxsinger.yaml"
 PHONESET = "train/lora_jp/jp_phone_set.json"
 METADATA = "train/lora_jp/dataset/metadata.json"
 WAV_DIR = "train/lora_jp/dataset/wavs"
+# JVS-MuSiC extra dataset (merged with PJS for training)
+JVS_METADATA = "train/lora_jp/dataset_jvs/metadata.json"
+JVS_WAV_DIR = "train/lora_jp/dataset_jvs"
 ONNX_JP_DIR = os.path.join(PROJECT_DIR, '..', 'onnx_models', 'fp16', 'JP')
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -64,6 +67,12 @@ def main():
         [sys.executable, "train/lora_jp/prepare_dataset.py"]
     )
 
+    # Step 1b: Prepare JVS-MuSiC dataset (audio -> metadata.json + wavs via ROSVOT + G2P)
+    run_step(
+        "[Step 1b/9] Preparing JVS-MuSiC dataset (ROSVOT note transcription + jp_g2p)",
+        [sys.executable, "train/lora_jp/prepare_jvs_dataset.py"]
+    )
+
     # Step 2: Generate phoneme mapping
     run_step(
         "[Step 2/9] Generating phoneme mapping",
@@ -91,6 +100,8 @@ def main():
          "--phoneset_path", PHONESET,
          "--dataset_metadata", METADATA,
          "--dataset_wav_dir", WAV_DIR,
+         "--extra_dataset_metadata", JVS_METADATA,
+         "--extra_dataset_wav_dir", JVS_WAV_DIR,
          "--output_dir", OUTPUT_DIR,
          "--init_embed", f"{OUTPUT_DIR}/init_embed.pt",
          "--batch_size", "1",
@@ -123,6 +134,8 @@ def main():
          "--phoneset_path", PHONESET,
          "--dataset_metadata", METADATA,
          "--dataset_wav_dir", WAV_DIR,
+         "--extra_dataset_metadata", JVS_METADATA,
+         "--extra_dataset_wav_dir", JVS_WAV_DIR,
          "--output_dir", OUTPUT_DIR,
          "--resume", f"{OUTPUT_DIR}/stage1/best.pt",
          "--batch_size", "1",
@@ -155,6 +168,8 @@ def main():
          "--phoneset_path", PHONESET,
          "--dataset_metadata", METADATA,
          "--dataset_wav_dir", WAV_DIR,
+         "--extra_dataset_metadata", JVS_METADATA,
+         "--extra_dataset_wav_dir", JVS_WAV_DIR,
          "--output_dir", OUTPUT_DIR,
          "--resume", f"{OUTPUT_DIR}/stage2/best.pt",
          "--batch_size", "1",
