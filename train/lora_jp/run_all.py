@@ -44,9 +44,9 @@ CONFIG = {
     # Training
     "device":         "cuda",
     "batch_size":     4,
-    "lr_phase1":      5e-5,
-    "lr_phase2":      5e-5,
-    "lr_phase3":      2e-5,
+    "lr_phase1":      2e-4,
+    "lr_phase2":      1e-4,
+    "lr_phase3":      5e-5,
     "num_workers":    0,
     "val_ratio":      0.1,
     "seed":           42,
