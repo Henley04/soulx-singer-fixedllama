@@ -6,12 +6,13 @@
 
 | 指标 | 值 |
 |------|-----|
-| 数据集 | PJS Corpus (100首歌，~15分钟) |
+| 数据集 | PJS Corpus (100首,~15分钟) + JVS-MuSiC (100说话人×2首,~120分钟) |
+| 训练样本数 | 300 (PJS 100 + JVS 200) |
 | 可训练参数 | ~4.25M (preflow + JP embedding + cond_emb) |
-| 训练阶段 | 三阶段 (warmup → embed FT → joint) |
+| 训练阶段 | 三阶段 (warmup 15ep → embed FT 40ep → joint 80ep) |
 | GPU | RTX 5060 8GB (bf16 autocast + gradient checkpointing) |
 | 精度 | bfloat16 autocast (无量化，无精度损失) |
-| batch_size | 4 (gradient checkpointing 省显存) |
+| batch_size | 1 (ConcatDataset 合并 PJS+JVS) |
 
 ## 文件结构
 
@@ -20,14 +21,17 @@ train/lora_jp/
 ├── jp_phone_set.json       # 扩展音素表 (3000 base + 33 JP = 3033)
 ├── jp_phoneme_mapping.json # JP 音素到 EN 源音素的映射 (配置驱动)
 ├── prepare_dataset.py      # PJS Corpus → 训练数据 (含 SP/slur 样本)
-├── dataset.py              # PyTorch Dataset (确定性 wav 匹配)
+├── prepare_jvs_dataset.py  # JVS-MuSiC → 训练数据 (ROSVOT + jp_g2p)
+├── jp_g2p.py               # 日语 G2P (JS 移植，训练-推理一致)
+├── jvs_lyrics.json         # JVS-MuSiC 公有领域歌词 (26 首童谣)
+├── dataset.py              # PyTorch Dataset (确定性 wav 匹配, 支持 pjs*/jvs* 前缀)
 ├── phoneme_mapping.py      # 生成 jp_phoneme_mapping.json
 ├── init_embeddings.py      # 初始化 JP 嵌入 (只 L2 归一化 JP 行)
-├── train_staged.py         # 三阶段训练脚本 (主入口)
+├── train_staged.py         # 三阶段训练脚本 (主入口, --extra_dataset_* 合并数据)
 ├── validate_and_rollback.py # 验证 + 回滚决策 (使用独立 val 集)
 ├── verify_checkpoint.py    # Checkpoint 质量检查
-├── export_onnx.py          # 导出 ONNX (text_encoder + preflow)
-├── run_pipeline.py         # 一键训练管线 (8 步)
+├── export_onnx.py          # 导出 ONNX (text_encoder + preflow + cond_emb)
+├── run_pipeline.py         # 一键训练管线 (9 步, 含 JVS 预处理)
 └── run_pipeline.sh         # Shell 包装
 ```
 
@@ -186,6 +190,44 @@ python train/lora_jp/export_onnx.py \
 3. 音素名使用 `jp_` 前缀或裸名（自动映射）
 4. 修改 `prepare_dataset.py` 中的路径后运行训练
 
+## JVS-MuSiC 数据集支持
+
+JVS-MuSiC 提供纯音频（无 .lab/.mid/歌词），需要额外预处理：
+
+### 预处理流程 (`prepare_jvs_dataset.py`)
+
+1. **ROSVOT NoteTranscriber** — 从音频转录音符（音高 + 时序）
+2. **RMVPE F0Extractor** — 提取帧级 F0
+3. **jp_g2p.py** — 公有领域歌词转音素（JS `_japaneseG2p` 的 Python 移植）
+4. **音节-音符对齐** — 按音节数量匹配（1:1 / 合并 / 拆分），输出 `jp_t-a` 合并格式
+
+### 数据集布局
+
+```
+datasets/jvs_music_ver1/
+├── jvs001/ ... jvs100/
+│   ├── song_common/wav/{modified_grouped,modified,raw}.wav  # 共同曲 (かたつむり)
+│   └── song_unique/wav/raw.wav                               # 独唱曲 (童谣)
+├── singer_info.txt
+└── oneness/, similarity/  # 说话人相似度评估 (训练未用)
+```
+
+### 歌词来源
+
+`jvs_lyrics.json` 包含 26 首日本公有领域童谣歌词（纯假名，无汉字）。
+共同曲为 `かたつむり`，独唱曲从歌词库按 `singer_info.txt` 匹配。
+
+### 合并训练
+
+`train_staged.py` 通过 `--extra_dataset_metadata` / `--extra_dataset_wav_dir` 参数
+使用 `ConcatDataset` 合并 PJS + JVS 数据。`run_pipeline.py` 已自动传递这些参数。
+
+### 修复记录
+
+- **F0Extractor 构造**：使用 `model_path=`/`is_half=` 而非 `f0_extractor="rmvpe"`
+- **F0Extractor 方法**：调用 `process(wav_path)` 而非 `extract(wav, sr)`
+- **ROSVOT word_bd_pred**：`infer_sample` 中 `outputs['word_bd_pred']` 改为 `word_bd[0]`（变量来自 wbd_predictor）
+
 ## 依赖
 
 - PyTorch >= 2.0
@@ -196,3 +238,5 @@ python train/lora_jp/export_onnx.py \
 - praat-parselmouth (F0提取)
 - soundfile
 - onnxruntime (ONNX 导出验证)
+- librosa (JVS 音频加载)
+- pyworld (ROSVOT 依赖，Python 3.14 需 stub)

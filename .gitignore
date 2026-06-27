@@ -33,9 +33,14 @@ dev/
 
 # Data
 data/
+datasets/
 outputs/
 deploy/
 .gradio/
+
+# Generated training data
+train/lora_jp/dataset/
+train/lora_jp/dataset_jvs/
 
 # midi editor
 node_modules/

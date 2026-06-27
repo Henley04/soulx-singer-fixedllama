@@ -210,7 +210,7 @@ def infer_sample(
     note2words = None
 
     if apply_rwbd_:
-        word_bd_np = outputs['word_bd_pred'][0].detach().cpu().numpy()[:real_len]
+        word_bd_np = word_bd[0].detach().cpu().numpy()[:real_len]
         word_durs_derived = np.array(bd_to_durs(word_bd_np)) * hparams['hop_size'] / hparams['audio_sample_rate']
         word_durs_for_reg = word_durs_derived
         word_bd_for_reg = word_bd_np

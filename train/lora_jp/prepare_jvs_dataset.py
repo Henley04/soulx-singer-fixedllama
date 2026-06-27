@@ -273,8 +273,8 @@ def process_speaker(
         import librosa
         wav, sr = librosa.load(str(wav_path), sr=None, mono=True)
         if verbose:
-            print(f"    extracting f0 (sr={sr}, len={len(wav)/sr:.1f}s)...")
-        f0 = f0_extractor.extract(wav, sr)
+            print(f"    extracting f0 from {wav_path.name} (sr={sr}, len={len(wav)/sr:.1f}s)...")
+        f0 = f0_extractor.process(str(wav_path))
         f0_out_path = output_dir / f"{item_name}_f0.npy"
         np.save(f0_out_path, f0)
 
@@ -370,8 +370,8 @@ def main():
         print("Loading ROSVOT note transcriber...")
         from preprocess.tools.note_transcription.model import NoteTranscriber
 
-        rosvot_ckpt = str(ROSVOT_DIR / "rosvot" / "checkpoint_08000000.pth.tar")
-        rwbd_ckpt = str(ROSVOT_DIR / "rwbd" / "checkpoint_00900000.pth.tar")
+        rosvot_ckpt = str(ROSVOT_DIR / "rosvot" / "model.pt")
+        rwbd_ckpt = str(ROSVOT_DIR / "rwbd" / "model.pt")
 
         note_transcriber = NoteTranscriber(
             rosvot_model_path=rosvot_ckpt,
@@ -383,8 +383,8 @@ def main():
         print("Loading RMVPE f0 extractor...")
         from preprocess.tools.f0_extraction import F0Extractor
         f0_extractor = F0Extractor(
-            f0_extractor="rmvpe",
-            rmvpe_path=str(RMVPE_PATH),
+            model_path=str(RMVPE_PATH),
+            is_half=True,
             device=args.device,
         )
 
