@@ -1630,6 +1630,16 @@ def count_trainable_params(model) -> int:
 # ===========================================================================
 # 嵌入初始化（来自 init_embeddings.py）
 # ===========================================================================
+def _get_jp_token_indices(phoneset_path):
+    """从 phone_set.json 获取所有 jp_* token 对应的索引列表。"""
+    if not os.path.exists(phoneset_path):
+        return []
+    with open(phoneset_path, 'r', encoding='utf-8') as f:
+        phone_list = json.load(f)
+    indices = [i for i, ph in enumerate(phone_list) if ph.startswith('jp_')]
+    return indices
+
+
 def add_orthogonal_noise(vec, noise_scale=NOISE_SCALE):
     """添加正交扰动（保持范数，改变方向）。"""
     rand = torch.randn_like(vec)
@@ -1920,13 +1930,21 @@ def apply_lora_and_setup_trainable(model, stage):
             param.requires_grad = True
         print(f"  Stage {stage}: cond_emb (跨模态对齐层) 全量微调")
 
-    # embedding 全量训练（仅 JP 行，base 行梯度置零保护源语言）
+     # embedding 全量训练（仅 JP 行，base 行梯度置零保护源语言）
     embed_weight = model.note_text_encoder.weight
     embed_weight.requires_grad = True
 
+    # 从 phone_set 获取 JP token 的实际索引（不一定是 3000-3032）
+    jp_indices = _get_jp_token_indices(PHONE_SET_PATH)
+    print(f"  JP token indices: {len(jp_indices)} tokens "
+          f"(range {min(jp_indices)}-{max(jp_indices)})")
+
     def zero_base_grad(grad):
         grad = grad.clone()
-        grad[:JP_PHONEME_START] = 0
+        # 只保留 JP token 对应行的梯度；其余（源语言）行置零
+        mask = torch.zeros(grad.shape[0], dtype=torch.bool, device=grad.device)
+        mask[jp_indices] = True
+        grad = grad * mask.unsqueeze(1).float()
         return grad
     embed_weight.register_hook(zero_base_grad)
 
@@ -1944,7 +1962,9 @@ def count_trainable_params_v3(model, stage):
                  if p.requires_grad and ('lora_A' in n or 'lora_B' in n))
     embed_n = 0
     if model.note_text_encoder.weight.requires_grad:
-        embed_n = JP_PHONEME_COUNT * EMBED_DIM
+        jp_indices = _get_jp_token_indices(PHONE_SET_PATH)
+        n_jp = len(jp_indices) if jp_indices else JP_PHONEME_COUNT
+        embed_n = n_jp * EMBED_DIM
     cond_emb_n = 0
     cond_parent = model.cfm_decoder.model
     for p in cond_parent.cond_emb.parameters():
@@ -2165,7 +2185,12 @@ def save_checkpoint(model, optimizer, epoch, stage, loss, best_val_loss,
                 'alpha': module.alpha,
             }
     embed_weight = model.note_text_encoder.weight.data.clone()
-    jp_embed = embed_weight[JP_PHONEME_START:JP_PHONEME_START + JP_PHONEME_COUNT].clone()
+    # JP token 行按 phone_set 实际索引（而非硬编码 3000-3032）
+    jp_indices = _get_jp_token_indices(PHONE_SET_PATH)
+    if jp_indices:
+        jp_embed = embed_weight[jp_indices].clone()
+    else:
+        jp_embed = embed_weight[JP_PHONEME_START:JP_PHONEME_START + JP_PHONEME_COUNT].clone()
     # cond_emb 全量微调权重（跨模态对齐层）
     cond_parent = model.cfm_decoder.model
     cond_emb_state = {
@@ -2419,8 +2444,12 @@ def train_one_stage(stage, init_embed_path=None, resume_path=None, device='cuda'
               f'time={elapsed:.1f}s split={use_ps}(p={ps_prob})')
 
         if epoch % 5 == 0:
-            jp_embed = model.note_text_encoder.weight.data[
-                JP_PHONEME_START:JP_PHONEME_START + JP_PHONEME_COUNT]
+            jp_indices = _get_jp_token_indices(PHONE_SET_PATH)
+            if jp_indices:
+                jp_embed = model.note_text_encoder.weight.data[jp_indices]
+            else:
+                jp_embed = model.note_text_encoder.weight.data[
+                    JP_PHONEME_START:JP_PHONEME_START + JP_PHONEME_COUNT]
             jp_std = jp_embed.std().item()
             jp_norm = jp_embed.norm(dim=1).mean().item()
             print(f'  [Embed] JP std={jp_std:.4f}, norm={jp_norm:.3f}')
