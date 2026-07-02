@@ -79,7 +79,7 @@ NUM_WORKERS = None
 #   - diff_estimator (diffstep): 冻结，不微调
 STAGE_CONFIGS = {
     1: {
-        'epochs': 10,
+        'epochs': 8,           # 日志：ep8 val=30.34 BEST，ep9-10 过拟合(val→34.24)
         'lora_lr': 0.0,        # preflow LoRA 冻结
         'embed_lr': 1e-3,      # JP embedding 预热
         'cond_emb_lr': 1e-4,   # cond_emb 全量微调（预热阶段）
@@ -100,7 +100,9 @@ STAGE_CONFIGS = {
         'warmup_steps': 200,
         'use_prompt_split': True,
         'prompt_split_prob': 0.5,
-        'prompt_split_start_ep': 21,
+        # 日志：原值 21 导致 stage2 前 12 epoch 无 prompt 训练（浪费 24%）
+        # stage2 从 ep9 开始，ep11 = 2 epoch LoRA warmup 后即启用 prompt split
+        'prompt_split_start_ep': 11,
     },
     3: {
         'epochs': 20,
@@ -2025,7 +2027,9 @@ def build_scheduler(optimizer, total_steps, warmup_steps):
         if step < warmup_steps:
             return max(0.01, step / max(1, warmup_steps))
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return max(0.1, 0.5 * (1 + math.cos(math.pi * progress)))
+        # min_lr 0.1→0.01：日志显示 loss 在 32-34 平台期不再下降，
+        # 原 0.1 下限使后期 LR 偏高无法精调收敛
+        return max(0.01, 0.5 * (1 + math.cos(math.pi * progress)))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -2229,6 +2233,37 @@ def save_checkpoint(model, optimizer, epoch, stage, loss, best_val_loss,
     return last_path
 
 
+def _restore_partial_optimizer_state(optimizer, opt_state, cur_groups, saved_groups):
+    """跨阶段部分恢复 optimizer state。
+
+    当参数组数变化（如 stage1→2 新增 LoRA 组）时，按 name 匹配可恢复的分组，
+    仅恢复对应参数的 Adam exp_avg / exp_avg_sq 动量，未匹配的新分组保持初始零动量。
+    这避免了跨阶段完全丢弃动量导致的初始震荡（日志中 stage2 val_loss 高于 stage1 best 的根因）。
+    """
+    saved_by_name = {g.get('name', f'group{i}'): g for i, g in enumerate(saved_groups)}
+    saved_state = opt_state.get('state', {})
+    # 建立 saved 参数 id -> state 映射（按保存顺序）
+    saved_flat_params = []
+    for g in saved_groups:
+        saved_flat_params.extend(g.get('params', []))
+    for gi, cur_g in enumerate(cur_groups):
+        gname = cur_g.get('name', f'group{gi}')
+        if gname not in saved_by_name:
+            continue
+        saved_g = saved_by_name[gname]
+        saved_pids = saved_g.get('params', [])
+        cur_pids = cur_g.get('params', [])
+        if len(saved_pids) != len(cur_pids):
+            continue
+        for spid, cpid in zip(saved_pids, cur_pids):
+            if spid in saved_state:
+                # 手动注入 Adam 动量到 optimizer.state
+                optimizer.state[cpid] = {
+                    k: v.clone() if torch.is_tensor(v) else v
+                    for k, v in saved_state[spid].items()
+                }
+
+
 def load_checkpoint(model, optimizer, resume_path, stage):
     """从 checkpoint 恢复。"""
     if not os.path.exists(resume_path):
@@ -2290,14 +2325,23 @@ def load_checkpoint(model, optimizer, resume_path, stage):
             target.bias.data.copy_(cond_emb_state['bias'])
         print(f"  Restored cond_emb weights (full fine-tune)")
     if optimizer is not None and ckpt.get('optimizer_state') is not None:
-        if ckpt.get('stage') == stage:
-            try:
-                optimizer.load_state_dict(ckpt['optimizer_state'])
-                print(f"  Restored optimizer state (same stage {stage})")
-            except Exception as e:
-                print(f"  Skip optimizer state: {e}")
-        else:
-            print(f"  Skip optimizer state (cross-stage {ckpt.get('stage')}->{stage})")
+        try:
+            opt_state = ckpt['optimizer_state']
+            # 跨阶段恢复：尝试匹配参数组，跳过新增/移除的分组
+            # （stage1 可能只有 embed+cond_emb，stage2 新增 LoRA 组）
+            cur_groups = optimizer.param_groups
+            saved_groups = opt_state.get('param_groups', [])
+            if len(saved_groups) == len(cur_groups):
+                optimizer.load_state_dict(opt_state)
+                print(f"  Restored optimizer state (stage {ckpt.get('stage')}->{stage})")
+            else:
+                # 分组数不一致（跨阶段新增 LoRA 组）：仅恢复可匹配的 Adam 动量
+                _restore_partial_optimizer_state(optimizer, opt_state, cur_groups, saved_groups)
+                print(f"  Partially restored optimizer state "
+                      f"(stage {ckpt.get('stage')}->{stage}, "
+                      f"groups {len(saved_groups)}->{len(cur_groups)})")
+        except Exception as e:
+            print(f"  Skip optimizer state: {e}")
     epoch_start = ckpt.get('epoch', 0) + 1
     best_val_loss = ckpt.get('best_val_loss', ckpt.get('loss', float('inf')))
     return epoch_start, best_val_loss
@@ -2430,6 +2474,10 @@ def train_one_stage(stage, init_embed_path=None, resume_path=None, device='cuda'
 
     global_step = 0
     avg_loss = 0.0
+    # 早停：日志显示 stage1 ep8 后 val_loss 持续恶化（30.34→34.24），
+    # patience=8 避免在已过拟合时浪费训练资源
+    early_stop_patience = 8
+    epochs_no_improve = 0
     for epoch in range(epoch_start, epoch_end + 1):
         t0 = time.time()
         if cfg['use_prompt_split'] and epoch >= cfg['prompt_split_start_ep']:
@@ -2460,24 +2508,29 @@ def train_one_stage(stage, init_embed_path=None, resume_path=None, device='cuda'
                 writer.add_scalar('embed/jp_std', jp_std, epoch)
                 writer.add_scalar('embed/jp_mean_norm', jp_norm, epoch)
 
-        if epoch % 2 == 0:
-            val_loss = validate(
-                model, val_dataloader, device, epoch, writer, stage,
-                use_ps, ps_prob, amp_dtype)
-            print(f'  val_loss={val_loss:.4f}')
-            is_best = val_loss < best_val_loss
-            if is_best:
-                best_val_loss = val_loss
-            save_checkpoint(model, optimizer, epoch, stage, val_loss,
-                            best_val_loss, output_dir, is_best=is_best)
-            # 回传 checkpoint 到云平台，防止超时丢失
-            print('  [c2net] 上传 checkpoint 到云存储...')
-            upload_output()
-        elif epoch % 5 == 0:
-            save_checkpoint(model, optimizer, epoch, stage, avg_loss,
-                            best_val_loss, output_dir, is_best=False)
-            print('  [c2net] 上传 checkpoint 到云存储...')
-            upload_output()
+        # 每 epoch 验证（原每 2 epoch）：日志显示最佳点 ep8 在偶数 epoch，
+        # 奇数 epoch 无验证可能错过更优 checkpoint
+        val_loss = validate(
+            model, val_dataloader, device, epoch, writer, stage,
+            use_ps, ps_prob, amp_dtype)
+        print(f'  val_loss={val_loss:.4f}')
+        is_best = val_loss < best_val_loss
+        if is_best:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+        save_checkpoint(model, optimizer, epoch, stage, val_loss,
+                        best_val_loss, output_dir, is_best=is_best)
+        # 回传 checkpoint 到云平台，防止超时丢失
+        print('  [c2net] 上传 checkpoint 到云存储...')
+        upload_output()
+
+        # 早停检查
+        if epochs_no_improve >= early_stop_patience:
+            print(f'  [EarlyStop] {early_stop_patience} epochs 未改善 '
+                  f'(best={best_val_loss:.4f})，提前结束 stage {stage}')
+            break
 
     save_checkpoint(model, optimizer, epoch_end, stage, avg_loss,
                     best_val_loss, output_dir, is_best=False)
