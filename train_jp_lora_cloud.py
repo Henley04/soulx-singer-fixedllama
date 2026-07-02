@@ -3112,13 +3112,15 @@ def main():
         dry_run()
         return
 
-    # 强制重新准备：删除已有预处理/数据集目录
+    # 强制重新准备：删除已有预处理/数据集目录并重新生成预处理文件
     if args.force_prepare:
         print('[force_prepare] 删除旧的预处理与数据集目录...')
         for d in [_LOCAL_PREPROCESS_DIR, PREPARED_DATA_DIR]:
             if os.path.isdir(d):
                 shutil.rmtree(d)
                 print(f'  已删除: {d}')
+        _ensure_pjs_extracted()
+        _ensure_preprocess_files()
 
     # 验证源语言保护
     if args.verify_protection:
