@@ -137,6 +137,7 @@ import argparse
 import hashlib
 import shutil
 import importlib.util
+import concurrent.futures
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
@@ -1018,19 +1019,16 @@ def process_jsut_dataset(jsut_dir, output_dir, sample_rate=24000, max_samples=0)
 
     wavs_out_dir = os.path.join(output_dir, 'wavs')
     os.makedirs(wavs_out_dir, exist_ok=True)
-    metadata_list = []
 
-    for i, (wav_id, text) in enumerate(transcripts):
+    def _process_one_jsut(wav_id, text):
+        """处理单个 JSUT 样本（闭包，用于线程池并行）。"""
         wav_path = os.path.join(wav_dir, f'{wav_id}.wav')
         if not os.path.exists(wav_path):
-            continue
+            return None
         try:
-            # G2P 转换
             tokens = lyrics_to_jp_tokens(text)
             if not tokens:
-                continue
-
-            # 重采样并保存
+                return None
             y, orig_sr = sf.read(wav_path, dtype='float32')
             if y.ndim > 1:
                 y = y[:, 0]
@@ -1039,8 +1037,6 @@ def process_jsut_dataset(jsut_dir, output_dir, sample_rate=24000, max_samples=0)
                 y = scipy.signal.resample(y, int(len(y) * sample_rate / orig_sr))
             out_wav = os.path.join(wavs_out_dir, f'jsut_{wav_id}.wav')
             sf.write(out_wav, y, sample_rate)
-
-            # F0 提取（中位数作为固定音高）
             f0 = None
             if parselmouth is not None:
                 try:
@@ -1051,12 +1047,9 @@ def process_jsut_dataset(jsut_dir, output_dir, sample_rate=24000, max_samples=0)
                     f0 = f0_arr
                 except Exception:
                     pass
-
-            # 构造 metadata（JSUT 无 MIDI，使用固定音高 60=C4）
             note_pitches = [60] * len(tokens)
             note_types = [2] * len(tokens)
-            durations = [0.3] * len(tokens)  # 默认 0.3s/音节
-
+            durations = [0.3] * len(tokens)
             meta = {
                 'id': f'jsut_{wav_id}',
                 'phoneme': ' '.join(tokens),
@@ -1066,15 +1059,35 @@ def process_jsut_dataset(jsut_dir, output_dir, sample_rate=24000, max_samples=0)
             }
             if f0 is not None and len(f0) > 0:
                 meta['f0'] = ' '.join(f'{v:.2f}' for v in f0.tolist())
-            metadata_list.append(meta)
-
-            if (i + 1) % 100 == 0:
-                print(f'  [JSUT {i+1}/{len(transcripts)}] processed')
-
+            return meta
         except Exception as e:
             print(f'  [JSUT] 跳过 {wav_id}: {e}')
-            continue
+            return None
 
+    # 并行处理（GIL 释放的 C 扩展：soundfile/parselmouth/scipy）
+    max_workers = min(8, max(2, (os.cpu_count() or 4) // 2))
+    print(f'  使用 {max_workers} 线程并行处理')
+
+    metadata_list = [None] * len(transcripts)
+    done_count = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(_process_one_jsut, wav_id, text): i
+            for i, (wav_id, text) in enumerate(transcripts)
+        }
+        for future in concurrent.futures.as_completed(future_to_idx):
+            i = future_to_idx[future]
+            done_count += 1
+            try:
+                meta = future.result()
+                if meta is not None:
+                    metadata_list[i] = meta
+            except Exception as e:
+                print(f'  [JSUT] 跳过 {transcripts[i][0]}: {e}')
+            if done_count % 100 == 0:
+                print(f'  [JSUT {done_count}/{len(transcripts)}] processed')
+
+    metadata_list = [m for m in metadata_list if m is not None]
     print(f'JSUT: processed {len(metadata_list)} samples')
     return metadata_list
 
@@ -1340,19 +1353,36 @@ def process_gtsinger_dataset(gtsinger_ja_dir, output_dir, sample_rate=24000,
         samples = samples[:max_samples]
 
     print(f'  发现 {len(samples)} 个 GTSinger 样本')
-    metadata_list = []
-    for i, (json_path, wav_path, sample_id) in enumerate(samples):
-        try:
-            meta = process_one_gtsinger_sample(
-                json_path, wav_path, output_dir, sample_id, sample_rate, hop_size)
-            if meta is not None:
-                metadata_list.append(meta)
-            if (i + 1) % 50 == 0:
-                print(f'  [GTSinger {i+1}/{len(samples)}] processed')
-        except Exception as e:
-            print(f'  [GTSinger] 跳过 {sample_id}: {e}')
-            continue
 
+    # 并行处理：F0 提取 (parselmouth) + 音频读写 (soundfile) + 重采样 (scipy)
+    # 均为释放 GIL 的 C 扩展，ThreadPoolExecutor 可有效并行
+    max_workers = min(8, max(2, (os.cpu_count() or 4) // 2))
+    print(f'  使用 {max_workers} 线程并行处理')
+
+    metadata_list = [None] * len(samples)
+    done_count = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(
+                process_one_gtsinger_sample,
+                json_path, wav_path, output_dir, sample_id,
+                sample_rate, hop_size
+            ): i
+            for i, (json_path, wav_path, sample_id) in enumerate(samples)
+        }
+        for future in concurrent.futures.as_completed(future_to_idx):
+            i = future_to_idx[future]
+            done_count += 1
+            try:
+                meta = future.result()
+                if meta is not None:
+                    metadata_list[i] = meta
+            except Exception as e:
+                print(f'  [GTSinger] 跳过 {samples[i][2]}: {e}')
+            if done_count % 50 == 0:
+                print(f'  [GTSinger {done_count}/{len(samples)}] processed')
+
+    metadata_list = [m for m in metadata_list if m is not None]
     print(f'GTSinger: processed {len(metadata_list)}/{len(samples)} samples')
     return metadata_list
 
