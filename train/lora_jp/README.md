@@ -6,13 +6,17 @@
 
 | 指标 | 值 |
 |------|-----|
-| 数据集 | PJS Corpus (100首,~15分钟) + JVS-MuSiC (100说话人×2首,~120分钟) |
-| 训练样本数 | 300 (PJS 100 + JVS 200) |
+| 数据集 | PJS Corpus (100首,~15分钟) + JVS-MuSiC (100说话人×2首,~120分钟) + GTSinger Japanese (可选,IPA 标注) |
+| 训练样本数 | 300 (PJS 100 + JVS 200,可追加 GTSinger) |
 | 可训练参数 | ~4.25M (preflow + JP embedding + cond_emb) |
 | 训练阶段 | 三阶段 (warmup 15ep → embed FT 40ep → joint 80ep) |
 | GPU | RTX 5060 8GB (bf16 autocast + gradient checkpointing) |
 | 精度 | bfloat16 autocast (无量化，无精度损失) |
 | batch_size | 1 (ConcatDataset 合并 PJS+JVS) |
+
+> **云端训练**：`SoulX-Singer/train_jp_lora_cloud.py` 是 c2net 云端一键训练脚本，
+> 在本地 `train/lora_jp/` 流水线基础上整合了 PJS+JSUT+JVS+GTSinger 数据准备与
+> 三阶段训练，支持 `--gtsinger_only` / `--no_gtsinger` 等开关。详见脚本顶部文档字符串。
 
 ## 文件结构
 
@@ -227,6 +231,98 @@ datasets/jvs_music_ver1/
 - **F0Extractor 构造**：使用 `model_path=`/`is_half=` 而非 `f0_extractor="rmvpe"`
 - **F0Extractor 方法**：调用 `process(wav_path)` 而非 `extract(wav, sr)`
 - **ROSVOT word_bd_pred**：`infer_sample` 中 `outputs['word_bd_pred']` 改为 `word_bd[0]`（变量来自 wbd_predictor）
+
+## GTSinger Japanese 数据集支持（云端脚本）
+
+GTSinger 提供带 IPA 音素标注和 MIDI 音高的多技巧演唱数据，可作为 PJS/JVS 的补充数据源。
+此支持仅在云端脚本 `SoulX-Singer/train_jp_lora_cloud.py` 中实现（本地 `train/lora_jp/` 流水线不涉及）。
+
+### 目录结构
+
+```
+GTSinger/Japanese/{singer}/{technique}/{song}/{group}/{sample_id}.json+.wav
+```
+
+- `singer`：如 `JA-Soprano-1`、`JA-Tenor-2`
+- `technique`：如 `Breathy`、`Vibrato`、`Glissando`、`Control_Group`、`Falsetto` 等
+- `song`：歌曲名（可能为日文/中文，非 ASCII 字符自动转 md5 哈希）
+- `group`：如 `Breathy_Group`、`Control_Group`
+- `sample_id`：`0000`、`0001`...（每个样本对应一对 .json + .wav）
+
+### JSON 格式
+
+每个 `.json` 是一个 word 数组，每个 word 含：
+
+| 字段 | 说明 |
+|------|------|
+| `word` | 歌词（含 `<AP>` 气口标记） |
+| `ph` | IPA 音素数组（如 `["t","a"]`、`["ɕ","i"]`、`["<AP>"]`） |
+| `ph_start` / `ph_end` | 每个音素的起止时间（秒） |
+| `note` | MIDI 音高数组（**支持 melisma**：一个 word 可对应多个 note） |
+| `note_dur` / `note_start` / `note_end` | 音符时序 |
+
+### IPA → PJS base 音素映射
+
+GTSinger 使用 IPA 标注，需要映射到 PJS base 音素集以复用现有 `jp_*` token 体系：
+
+| IPA | PJS base | 说明 |
+|-----|----------|------|
+| `a` `i` `u` `e` `o` | a i u e o | 五元音（直接映射） |
+| `ɯ` | u | 日语闭后不圆唇元音 → u |
+| `ɨ` `ɨ̥` | u | 元音清化版本 → u |
+| `oː` | o | 长音 → 去长音标记 |
+| `k` `s` `t` `n` `h` `m` `r` `w` `j` `g` `d` `b` `p` | 同名 | 直接映射 |
+| `dz` | z | 浊塞擦音 → z |
+| `ɡ` | g | 浊软腭塞音 → g |
+| `c` | k | 清硬腭塞音 → k |
+| `ɲ` | ny | 硬腭鼻音 → ny |
+| `ɾ` `ɾʲ` | r | 闪音 → r（`ɾʲ` 拗音形式） |
+| `ɕ` | sh | 清龈硬腭擦音 → sh |
+| `ts` | ts | 清齿龈塞擦音 → ts |
+| `bʲ` | b | 硬腭化双唇塞音 → b |
+| `ʔ` | cl | 声门塞音 → cl（促音） |
+| `ɴ` | n | 拨音 → n |
+| `<AP>` | `<AP>` | 气口 → note_type=1 |
+
+未知 IPA 音素会通过 `_gtsinger_map_phoneme()` 中的安全回退逻辑处理：
+剥离 `ː`（长音）、`̥`（清化）、`ʲ`（硬腭化）等变音符号后重新查表；
+仍无法识别则回退到 `pau`（静音）。
+
+### Melisma（一字多音）处理
+
+GTSinger 中一个 word 可能对应多个 note（melisma 转音）。
+`_gtsinger_word_to_tokens()` 使用**音素中点对齐**策略将 word 内的音素分配到各 note：
+
+1. 计算每个音素的中点时间 `(ph_start + ph_end) / 2`
+2. 计算每个 note 的中点时间 `(note_start + note_end) / 2`
+3. 把每个音素分配给距其时间中点最近的 note
+4. 同一 note 范围内的连续音素合并为一个 `jp_辅音-元音` token（如 `jp_t-a`）
+
+这保证了 melisma 音节与 PJS lab 数据的 `jp_*` 合并格式一致，复用现有训练-推理对齐逻辑。
+
+### 用法
+
+```bash
+# 仅准备 GTSinger 数据
+python train_jp_lora_cloud.py --prepare_only --gtsinger_only
+
+# 全流水线（含 GTSinger）
+python train_jp_lora_cloud.py
+
+# 排除 GTSinger 数据
+python train_jp_lora_cloud.py --no_gtsinger
+```
+
+数据集挂载路径（c2net）：
+- `{dataset_path}/GTSinger/Japanese/...`（推荐）
+- `{dataset_path}/Japanese/...`（兼容布局）
+
+### 输出格式
+
+每个 GTSinger 样本生成：
+- `wavs/gts_{singer}_{technique}_{md5(song)}_{sample_id}.wav` — 重采样到 24kHz 的音频
+- `metadata.json` 中追加条目，字段与 PJS/JVS 一致：
+  - `id`、`phoneme`（`jp_*` token 数组）、`duration`、`note_pitch`、`note_type`、`f0`
 
 ## 依赖
 

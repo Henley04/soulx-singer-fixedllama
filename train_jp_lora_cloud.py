@@ -12,11 +12,13 @@ lora.py / init_embeddings.py / dataset.py / train_lora.py / validate.py / export
 
 执行模式：
   python train_jp_lora_cloud.py --dry_run             # 部署前验证（不需要真实模型/数据）
-  python train_jp_lora_cloud.py --prepare_only        # 仅准备数据集（PJS+JSUT+JVS）
+  python train_jp_lora_cloud.py --prepare_only        # 仅准备数据集（PJS+JSUT+JVS+GTSinger）
   python train_jp_lora_cloud.py --train_only         # 仅训练（数据已准备）
   python train_jp_lora_cloud.py --export_only        # 仅导出 ONNX
   python train_jp_lora_cloud.py --verify_protection  # 验证源语言权重未变化
   python train_jp_lora_cloud.py                       # 全流水线（prepare→train→export）
+  python train_jp_lora_cloud.py --prepare_only --gtsinger_only  # 仅准备 GTSinger 数据
+  python train_jp_lora_cloud.py --no_gtsinger        # 排除 GTSinger 数据
 
 训练目标（按组件）：
   - note_text_encoder (embedding): 全量训练
@@ -45,6 +47,10 @@ lora.py / init_embeddings.py / dataset.py / train_lora.py / validate.py / export
 数据集：
   - PJS Corpus（日语歌唱，主要数据源，100 样本已预处理）
 https://www.modelscope.cn/datasets/aihobbyist/StarRail_Dataset/resolve/master/StarRail4.2_JP.7z  #Genshin Impact JP Voice,modelscope highspeed download.
+  - GTSinger Japanese（日语歌唱，IPA 音素标注，含 Breathy/Glissando/Vibrato 技巧）
+    目录结构: GTSinger/Japanese/{singer}/{technique}/{song}/{group}/{sample_id}.json+.wav
+    每个 JSON 含 word 数组，每个 word 含 ph(音素)/note(MIDI)/note_dur/时序信息。
+    支持 melisma（一个 word 对应多个 note），IPA 音素自动映射到 PJS base 音素集。
 """
 
 # LoRA 超参数（A100 40G 最佳实践）
@@ -317,6 +323,17 @@ PJS_CORPUS_DIR = _PJS_CORPUS_EXTRACT if os.path.isdir(_PJS_CORPUS_EXTRACT) else 
 PJS_LAB_DIR = _PJS_LAB_EXTRACT if os.path.isdir(_PJS_LAB_EXTRACT) else _dataset_path + "/PJS/lab"
 JSUT_DIR = _dataset_path + "/JSUT" if os.path.isdir(_dataset_path + "/JSUT") else ""
 JVS_PREPARED_DIR = _preprocess_path + "/dataset"  # JVS 预处理数据打包在预处理文件中（若不存在则跳过）
+
+# GTSinger 数据集路径（c2net 挂载路径下）
+# 支持两种目录结构：GTSinger/Japanese/... 或直接 Japanese/...
+GTSINGER_DIR = ""
+GTSINGER_JA_DIR = ""
+for _gts_root in [_dataset_path + "/GTSinger", _dataset_path]:
+    _gts_ja = os.path.join(_gts_root, "Japanese")
+    if os.path.isdir(_gts_ja):
+        GTSINGER_DIR = _gts_root
+        GTSINGER_JA_DIR = _gts_ja
+        break
 
 # 输出路径（所有输出必须保存在 c2net_context.output_path 下）
 PREPARED_DATA_DIR = _output_path + "/dataset"
@@ -624,6 +641,51 @@ PJS_CONSONANTS = {
     'f', 'j', 'ch', 'sh', 'ts', 'ky', 'gy', 'ny', 'hy', 'my', 'ry', 'py', 'by', 'cl',
 }
 PJS_VOWELS = {'a', 'i', 'u', 'e', 'o', 'I', 'N', 'O', 'U'}
+
+
+# ===========================================================================
+# GTSinger 数据集处理（IPA 音素 → PJS base 音素映射）
+# ===========================================================================
+# GTSinger 使用 IPA 标注，需映射到 PJS base 音素集以复用 jp_* token 体系
+GTSINGER_PHONEME_MAP = {
+    # 元音
+    'a': 'a', 'e': 'e', 'i': 'i', 'o': 'o', 'u': 'u',
+    'ɯ': 'u',      # 日语不圆唇后元音 → u
+    'ɨ': 'u',      # 中央元音（す/つ）→ u
+    'ɨ̥': 'u',     # 清化版本 → u
+    'oː': 'o',     # 长元音去长度标记
+    'aː': 'a', 'iː': 'i', 'uː': 'u', 'eː': 'e', 'ɯː': 'u',
+    # 塞音
+    'k': 'k', 'ɡ': 'g', 'g': 'g',
+    't': 't', 'd': 'd',
+    'p': 'p', 'b': 'b',
+    'c': 'k',     # [c] 是 /k/ 在高元音前的硬腭变体 → k
+    # 擦音
+    's': 's', 'z': 'z', 'dz': 'z',
+    'h': 'h', 'f': 'f', 'ɸ': 'f',   # ɸ 双唇擦音 → f
+    'ɕ': 'sh',    # 齿龈硬腭擦音 → sh
+    'sh': 'sh',   # 安全回退（部分文件可能用 sh 而非 ɕ）
+    'ç': 'hy',    # 硬腭擦音 → hy（ひ）
+    # 塞擦音
+    'ts': 'ts', 'ch': 'ch',
+    # 鼻音
+    'n': 'n', 'ɲ': 'ny',   # 硬腭鼻音 → ny（に）
+    'm': 'm',
+    'ɴ': 'n',     # 拨音（音节末鼻音）→ n
+    # 近音/闪音
+    'j': 'j', 'w': 'w', 'y': 'y',
+    'ɾ': 'r',     # 齿龈闪音 → r
+    'ɾʲ': 'ry',   # 硬腭化闪音 → ry（り）
+    'r': 'r',
+    # 硬腭化辅音
+    'bʲ': 'by',
+    'kʲ': 'ky', 'gʲ': 'gy', 'pʲ': 'py', 'mʲ': 'my',
+    'hʲ': 'hy', 'sʲ': 'sy',
+    # 促音/喉塞音
+    'ʔ': 'cl', 'cl': 'cl', 'Q': 'cl',
+    # 停顿
+    '<AP>': '<SP>',
+}
 
 
 def split_lab_into_syllables(lab_segments: List[Dict]) -> List[Dict]:
@@ -1006,10 +1068,289 @@ def process_jsut_dataset(jsut_dir, output_dir, sample_rate=24000, max_samples=0)
 
 
 # ===========================================================================
+# GTSinger 数据集处理（IPA 标注 → jp_* token）
+# ===========================================================================
+def _gtsinger_map_phoneme(ipa_ph):
+    """GTSinger IPA 音素 → PJS base 音素，未知音素回退到 pau。"""
+    base = GTSINGER_PHONEME_MAP.get(ipa_ph)
+    if base is not None:
+        return base
+    # 去除长度标记 ː 后重试
+    stripped = ipa_ph.replace('ː', '').replace('̥', '').replace('̩', '')
+    if stripped != ipa_ph:
+        base = GTSINGER_PHONEME_MAP.get(stripped)
+        if base is not None:
+            return base
+    print(f'  [GTSinger] WARNING: 未知音素 "{ipa_ph}" → pau')
+    return 'pau'
+
+
+def _gtsinger_word_to_tokens(word_entry, min_dur=0.12):
+    """将一个 GTSinger word 条目转换为 (phonemes, durations, note_pitches, note_types)。
+
+    处理逻辑：
+      - <AP> → <SP> token (note_pitch=0, type=1)
+      - 单 note: 合并所有音素为 jp_C-V 形式，一个 token
+      - 多 note (melisma): 按时序对齐音素到 note，每个 note 一个 token
+        无法对齐时回退为重复合并 token（首 note type=2，后续 type=3）
+    """
+    ph_list = word_entry.get('ph', [])
+    notes = word_entry.get('note', [0])
+    note_dur = word_entry.get('note_dur', [0.3])
+    word = word_entry.get('word', '')
+
+    # 停顿
+    if word == '<AP>' or ph_list == ['<AP>']:
+        dur = float(note_dur[0]) if note_dur else 0.3
+        return ['<SP>'], [max(dur, min_dur)], [0], [1]
+
+    if not ph_list:
+        return [], [], [], []
+
+    # 映射 IPA → PJS base
+    mapped_ph = []
+    for ipa in ph_list:
+        base = _gtsinger_map_phoneme(ipa)
+        if base == '<SP>':
+            continue
+        mapped_ph.append(base)
+
+    if not mapped_ph:
+        return ['<SP>'], [max(float(note_dur[0]) if note_dur else 0.3, min_dur)], [0], [1]
+
+    # 构建 jp_ 前缀音素
+    jp_parts = []
+    for base_ph in mapped_ph:
+        jp_ph = PJS_PHONEME_MAP.get(base_ph, f'jp_{base_ph}')
+        if jp_ph == '<SP>':
+            continue
+        jp_parts.append(jp_ph)
+
+    if not jp_parts:
+        return ['<SP>'], [max(float(note_dur[0]) if note_dur else 0.3, min_dur)], [0], [1]
+
+    # 合并 token: jp_{p1}-{p2}-...
+    def _merge(parts):
+        return 'jp_' + '-'.join(p[3:] for p in parts)
+
+    merged_token = _merge(jp_parts)
+
+    # 单 note
+    if len(notes) <= 1:
+        dur = float(note_dur[0]) if note_dur else 0.3
+        pitch = int(notes[0]) if notes and notes[0] else 60
+        return [merged_token], [max(dur, min_dur)], [pitch], [2]
+
+    # 多 note (melisma): 尝试按时序对齐音素到 note
+    ph_starts = word_entry.get('ph_start', [])
+    ph_ends = word_entry.get('ph_end', [])
+    note_starts = word_entry.get('note_start', [])
+    note_ends = word_entry.get('note_end', [])
+
+    phonemes_out = []
+    durations_out = []
+    note_pitches_out = []
+    note_types_out = []
+
+    can_align = (len(ph_starts) == len(ph_list) and
+                 len(note_starts) == len(notes) and
+                 len(ph_list) >= len(notes))
+
+    if can_align:
+        # 按音素中点距离最近的 note 分组
+        note_groups = [[] for _ in range(len(notes))]
+        for pi, ipa in enumerate(ph_list):
+            if ipa == '<AP>':
+                continue
+            ph_mid = (float(ph_starts[pi]) + float(ph_ends[pi])) / 2
+            best_ni, best_dist = 0, float('inf')
+            for ni in range(len(notes)):
+                nm = (float(note_starts[ni]) + float(note_ends[ni])) / 2
+                dist = abs(ph_mid - nm)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_ni = ni
+            note_groups[best_ni].append(ipa)
+
+        for ni, group_ipas in enumerate(note_groups):
+            if not group_ipas:
+                # 该 note 无对应音素 → 用合并 token 作为 slur
+                dur = float(note_dur[ni]) if ni < len(note_dur) else 0.3
+                phonemes_out.append(merged_token)
+                durations_out.append(max(dur, min_dur))
+                note_pitches_out.append(int(notes[ni]) if notes[ni] else 60)
+                note_types_out.append(3 if ni > 0 else 2)
+                continue
+            group_mapped = []
+            for ipa in group_ipas:
+                base = _gtsinger_map_phoneme(ipa)
+                if base == '<SP>':
+                    continue
+                group_mapped.append(base)
+            if not group_mapped:
+                group_jp = jp_parts
+            else:
+                group_jp = [PJS_PHONEME_MAP.get(b, f'jp_{b}') for b in group_mapped
+                            if PJS_PHONEME_MAP.get(b, f'jp_{b}') != '<SP>']
+            token = _merge(group_jp) if group_jp else merged_token
+            dur = float(note_dur[ni]) if ni < len(note_dur) else 0.3
+            phonemes_out.append(token)
+            durations_out.append(max(dur, min_dur))
+            note_pitches_out.append(int(notes[ni]) if notes[ni] else 60)
+            note_types_out.append(3 if ni > 0 else 2)
+    else:
+        # 无法对齐 → 重复合并 token
+        for ni, note in enumerate(notes):
+            dur = float(note_dur[ni]) if ni < len(note_dur) else 0.3
+            phonemes_out.append(merged_token)
+            durations_out.append(max(dur, min_dur))
+            note_pitches_out.append(int(note) if note else 60)
+            note_types_out.append(3 if ni > 0 else 2)
+
+    return phonemes_out, durations_out, note_pitches_out, note_types_out
+
+
+def process_one_gtsinger_sample(json_path, wav_path, output_dir, sample_id,
+                                 sample_rate=24000, hop_size=480):
+    """处理一个 GTSinger 样本（json + wav）。"""
+    if sf is None:
+        raise ImportError("soundfile is required")
+    with open(json_path, 'r', encoding='utf-8') as f:
+        words = json.load(f)
+    if not words or not isinstance(words, list):
+        return None
+
+    min_dur = 6 * hop_size / sample_rate
+    phonemes = []
+    durations = []
+    note_pitches = []
+    note_types = []
+
+    for word_entry in words:
+        if not isinstance(word_entry, dict):
+            continue
+        phs, durs, pitches, types = _gtsinger_word_to_tokens(word_entry, min_dur)
+        phonemes.extend(phs)
+        durations.extend(durs)
+        note_pitches.extend(pitches)
+        note_types.extend(types)
+
+    if not phonemes:
+        return None
+
+    # 处理音频
+    y, orig_sr = sf.read(wav_path, dtype='float32')
+    if y.ndim > 1:
+        y = y[:, 0]
+    if orig_sr != sample_rate:
+        import scipy.signal
+        y = scipy.signal.resample(y, int(len(y) * sample_rate / orig_sr))
+
+    wavs_out_dir = os.path.join(output_dir, 'wavs')
+    os.makedirs(wavs_out_dir, exist_ok=True)
+    out_wav = os.path.join(wavs_out_dir, f'{sample_id}.wav')
+    sf.write(out_wav, y, sample_rate)
+
+    # F0 提取
+    f0 = None
+    if parselmouth is not None:
+        try:
+            f0 = extract_f0_parselmouth(wav_path, sample_rate)
+        except Exception as e:
+            print(f'  Warning: F0 extraction failed for {sample_id}: {e}')
+
+    metadata = {
+        'id': sample_id,
+        'phoneme': ' '.join(phonemes),
+        'duration': ' '.join(f'{d:.6f}' for d in durations),
+        'note_pitch': ' '.join(str(p) for p in note_pitches),
+        'note_type': ' '.join(str(t) for t in note_types),
+    }
+    if f0 is not None and len(f0) > 0:
+        metadata['f0'] = ' '.join(f'{v:.2f}' for v in f0.tolist())
+    return metadata
+
+
+def process_gtsinger_dataset(gtsinger_ja_dir, output_dir, sample_rate=24000,
+                              hop_size=480, max_samples=0):
+    """遍历 GTSinger Japanese 目录树，处理所有 json+wav 样本。
+
+    目录结构: {ja_dir}/{singer}/{technique}/{song}/{group}/{sample_id}.json+.wav
+    """
+    if not gtsinger_ja_dir or not os.path.isdir(gtsinger_ja_dir):
+        print(f'  [INFO] GTSinger 未配置或路径不存在: {gtsinger_ja_dir}')
+        return []
+
+    if sf is None:
+        print('  [WARNING] soundfile 未安装，跳过 GTSinger')
+        return []
+
+    print('=' * 60)
+    print('处理 GTSinger Japanese Corpus')
+    print('=' * 60)
+
+    # 收集所有 json+wav 对
+    samples = []
+    for singer in sorted(os.listdir(gtsinger_ja_dir)):
+        singer_dir = os.path.join(gtsinger_ja_dir, singer)
+        if not os.path.isdir(singer_dir):
+            continue
+        for technique in sorted(os.listdir(singer_dir)):
+            tech_dir = os.path.join(singer_dir, technique)
+            if not os.path.isdir(tech_dir):
+                continue
+            for song in sorted(os.listdir(tech_dir)):
+                song_dir = os.path.join(tech_dir, song)
+                if not os.path.isdir(song_dir):
+                    continue
+                for group in sorted(os.listdir(song_dir)):
+                    group_dir = os.path.join(song_dir, group)
+                    if not os.path.isdir(group_dir):
+                        continue
+                    for fname in sorted(os.listdir(group_dir)):
+                        if not fname.endswith('.json'):
+                            continue
+                        sample_id_num = os.path.splitext(fname)[0]
+                        json_path = os.path.join(group_dir, fname)
+                        wav_path = os.path.join(group_dir, sample_id_num + '.wav')
+                        if not os.path.exists(wav_path):
+                            continue
+                        # 构建 ASCII 安全的 sample_id
+                        sample_id = f'gts_{singer}_{technique}_{group}_{sample_id_num}'
+                        # 替换非 ASCII 字符为短哈希
+                        if not sample_id.isascii():
+                            import hashlib as _hl
+                            _h = _hl.md5(sample_id.encode('utf-8')).hexdigest()[:10]
+                            sample_id = f'gts_{singer}_{group}_{sample_id_num}_{_h}'
+                        samples.append((json_path, wav_path, sample_id))
+
+    if max_samples > 0:
+        samples = samples[:max_samples]
+
+    print(f'  发现 {len(samples)} 个 GTSinger 样本')
+    metadata_list = []
+    for i, (json_path, wav_path, sample_id) in enumerate(samples):
+        try:
+            meta = process_one_gtsinger_sample(
+                json_path, wav_path, output_dir, sample_id, sample_rate, hop_size)
+            if meta is not None:
+                metadata_list.append(meta)
+            if (i + 1) % 50 == 0:
+                print(f'  [GTSinger {i+1}/{len(samples)}] processed')
+        except Exception as e:
+            print(f'  [GTSinger] 跳过 {sample_id}: {e}')
+            continue
+
+    print(f'GTSinger: processed {len(metadata_list)}/{len(samples)} samples')
+    return metadata_list
+
+
+# ===========================================================================
 # 数据集准备主函数
 # ===========================================================================
-def prepare_datasets(include_pjs=True, include_jsut=True, include_jvs=True):
-    """合并 PJS + JSUT + JVS 数据集，输出统一的 metadata.json。"""
+def prepare_datasets(include_pjs=True, include_jsut=True, include_jvs=True,
+                     include_gtsinger=True):
+    """合并 PJS + JSUT + JVS + GTSinger 数据集，输出统一的 metadata.json。"""
     os.makedirs(PREPARED_DATA_DIR, exist_ok=True)
     all_metadata = []
 
@@ -1022,6 +1363,11 @@ def prepare_datasets(include_pjs=True, include_jsut=True, include_jvs=True):
         jsut_meta = process_jsut_dataset(JSUT_DIR, PREPARED_DATA_DIR, SAMPLE_RATE)
         all_metadata.extend(jsut_meta)
         print(f'  JSUT: {len(jsut_meta)} samples')
+
+    if include_gtsinger and GTSINGER_JA_DIR:
+        gts_meta = process_gtsinger_dataset(GTSINGER_JA_DIR, PREPARED_DATA_DIR, SAMPLE_RATE, HOP_SIZE)
+        all_metadata.extend(gts_meta)
+        print(f'  GTSinger: {len(gts_meta)} samples')
 
     if include_jvs and os.path.isdir(JVS_PREPARED_DIR):
         # 复制已预处理的 JVS 数据
@@ -2618,6 +2964,10 @@ def main():
                         help='不包含 JSUT 数据集')
     parser.add_argument('--no_jvs', action='store_true',
                         help='不包含 JVS 数据集')
+    parser.add_argument('--no_gtsinger', action='store_true',
+                        help='不包含 GTSinger 数据集')
+    parser.add_argument('--gtsinger_only', action='store_true',
+                        help='仅使用 GTSinger 数据集（跳过 PJS/JSUT/JVS）')
     args = parser.parse_args()
 
     # 设备检测
@@ -2638,10 +2988,18 @@ def main():
 
     # 仅准备数据集
     if args.prepare_only:
-        prepare_datasets(
-            include_pjs=True,
-            include_jsut=not args.no_jsut,
-            include_jvs=not args.no_jvs)
+        if args.gtsinger_only:
+            prepare_datasets(
+                include_pjs=False,
+                include_jsut=False,
+                include_jvs=False,
+                include_gtsinger=True)
+        else:
+            prepare_datasets(
+                include_pjs=True,
+                include_jsut=not args.no_jsut,
+                include_jvs=not args.no_jvs,
+                include_gtsinger=not args.no_gtsinger)
         return
 
     # 仅训练
@@ -2678,10 +3036,18 @@ def main():
     # 1. 准备数据集
     if not os.path.exists(os.path.join(PREPARED_DATA_DIR, 'metadata.json')):
         print('\n[1/3] 准备数据集...')
-        prepare_datasets(
-            include_pjs=True,
-            include_jsut=not args.no_jsut,
-            include_jvs=not args.no_jvs)
+        if args.gtsinger_only:
+            prepare_datasets(
+                include_pjs=False,
+                include_jsut=False,
+                include_jvs=False,
+                include_gtsinger=True)
+        else:
+            prepare_datasets(
+                include_pjs=True,
+                include_jsut=not args.no_jsut,
+                include_jvs=not args.no_jvs,
+                include_gtsinger=not args.no_gtsinger)
     else:
         print(f'\n[1/3] 数据集已存在: {os.path.join(PREPARED_DATA_DIR, "metadata.json")}')
 
