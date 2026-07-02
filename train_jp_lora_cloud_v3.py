@@ -16,10 +16,16 @@ v3 改动版：在 v2 基础上，放开 22 个复用英语音素的梯度（复
   - 缓解：极小 lr（1e-5）+ 梯度裁剪 + 短训练周期，控制偏移幅度
   - 保护：非复用的 base 行（zh_*, yue_*, 未复用的 en_*）仍梯度置零
 
-接入方式：与 v2 平行，import 后替换对应函数。
+直接运行：python train_jp_lora_cloud_v3.py
+  - 无参数：全流水线（prepare → train → export）
+  - --prepare_only / --train_only / --export_only：分阶段执行
+  - --demo：仅查看复用音素列表和 lr 配置（不需模型/数据）
+  - 其他参数同 train_jp_lora_cloud.py（--no_jsut / --device 等）
+实现方式：运行时 monkey-patch v1 模块的关键函数为 v3 版本，复用 v1 全部基础设施。
 """
 
 import os
+import sys
 import json
 from typing import List, Dict, Tuple, Optional, Set
 
@@ -399,5 +405,65 @@ def _demo():
     print('\n' + USAGE_V3)
 
 
+# ===========================================================================
+# 自包含入口：直接 python train_jp_lora_cloud_v3.py 即可启动训练
+# ===========================================================================
+# 策略：import v1 模块，用 monkey-patch 把 v1 的关键函数/常量替换为 v3 版本，
+# 然后调用 v1 的 main()。数据准备、训练循环、导出逻辑复用 v1。
+# v3 相对 v2 的差异：复用音素也微调（极小 lr），需替换 apply_lora/build_optimizer
+# 和 STAGE_CONFIGS。init_jp_embeddings/lab 对齐等复用 v2 实现。
+
+def _patch_v1_with_v3():
+    """把 v1 模块的关键符号替换为 v3 版本。返回 v1 模块对象。"""
+    import train_jp_lora_cloud as v1
+
+    # --- 替换 STAGE_CONFIGS ---
+    v1.STAGE_CONFIGS = STAGE_CONFIGS_V3
+
+    # --- 替换 init_jp_embeddings ---
+    # v1 签名: init_jp_embeddings(model, mapping_path, phoneset_path)
+    # v3 签名: init_jp_embeddings_v3(model, phoneset_path)  -- 忽略 mapping_path
+    def init_jp_embeddings_wrapper(model, mapping_path=None, phoneset_path=None):
+        return init_jp_embeddings_v3(model, phoneset_path or v1.PHONE_SET_PATH)
+    v1.init_jp_embeddings = init_jp_embeddings_wrapper
+
+    # --- 替换 apply_lora_and_setup_trainable ---
+    # v1 签名: apply_lora_and_setup_trainable(model, stage)
+    # v3 签名: apply_lora_and_setup_trainable_v3(model, stage, phoneset_path)
+    def apply_lora_wrapper(model, stage):
+        return apply_lora_and_setup_trainable_v3(model, stage, v1.PHONE_SET_PATH)
+    v1.apply_lora_and_setup_trainable = apply_lora_wrapper
+
+    # --- 替换 build_optimizer ---
+    # 签名一致：(model, stage, lora_lr, embed_lr)
+    v1.build_optimizer = build_optimizer_v3
+
+    # --- 替换 lab_phonemes_to_notes / _gtsinger_word_to_tokens ---
+    # v3 沿用 v2 的对齐与映射逻辑
+    v1.lab_phonemes_to_notes = lab_phonemes_to_notes_v2
+    def gtsinger_wrapper(word_entry, min_dur=0.12):
+        return gtsinger_word_to_tokens_v2(word_entry)
+    v1._gtsinger_word_to_tokens = gtsinger_wrapper
+
+    return v1
+
+
+def main():
+    """v3 主入口：--demo 跑逻辑演示，否则 patch v1 后启动完整训练流水线。"""
+    if '--demo' in sys.argv:
+        _demo()
+        return
+
+    print('=' * 60)
+    print('train_jp_lora_cloud_v3.py — 促音/拨音 + 复用音素微调版')
+    print('=' * 60)
+    print('策略：jp_cl/jp_n 用正常 lr（3e-4）训练，22 个复用英语音素')
+    print(f'      用极小 lr（{REUSED_EMBED_LR}）微调，缓慢适应日语不破坏源语言。')
+    print()
+
+    v1 = _patch_v1_with_v3()
+    v1.main()
+
+
 if __name__ == '__main__':
-    _demo()
+    main()
