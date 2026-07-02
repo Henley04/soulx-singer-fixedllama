@@ -63,6 +63,10 @@ GRAD_CHECKPOINT = True
 VAL_RATIO = 0.1
 SEED = 42
 
+# DataLoader 并行加载：自动按 CPU 核数设置（留一半给主进程和 GPU 预处理）
+# 云端 A100 实例常见 8-24 vCPU，上限 8 避免小数据集下 worker 启动开销过大
+NUM_WORKERS = min(8, max(2, (os.cpu_count() or 4) // 2))
+
 # 三阶段训练配置
 # 训练目标说明：
 #   - note_text_encoder (embedding): 全量训练（仅 JP 行，base 行梯度置零保护源语言）
@@ -2257,10 +2261,14 @@ def train_one_stage(stage, init_embed_path=None, resume_path=None, device='cuda'
 
     train_dataloader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-        collate_fn=collate_fn, num_workers=0, pin_memory=True)
+        collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True,
+        persistent_workers=NUM_WORKERS > 0,
+        prefetch_factor=4 if NUM_WORKERS > 0 else None)
     val_dataloader = DataLoader(
         val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-        collate_fn=collate_fn, num_workers=0, pin_memory=True)
+        collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True,
+        persistent_workers=NUM_WORKERS > 0,
+        prefetch_factor=4 if NUM_WORKERS > 0 else None)
 
     # tensorboard
     try:
