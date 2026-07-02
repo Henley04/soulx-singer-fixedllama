@@ -1115,14 +1115,62 @@ def _gtsinger_map_phoneme(ipa_ph):
     return 'pau'
 
 
+def _split_into_syllables(mapped_ph):
+    """将 PJS base 音素列表切分成日语音节（辅音+元音组合）。
+
+    规则：
+      - 元音 (a/i/u/e/o/I/O/U) → 与前面待匹配辅音组成一个音节
+      - 拨音 n / 促音 cl / ʔ → 先关闭未配对辅音，再单独成音节
+      - 其他辅音 → 加入待匹配列表；若已有待匹配辅音则先关闭它
+        （日语音节最多一个辅音开头，连续辅音需拆开）
+      - 末尾未配对辅音 → 单独成音节
+
+    例: ['w','a','r','a','i'] → [['w','a'], ['r','a'], ['i']]
+         ['k','a','n']         → [['k','a'], ['n']]
+         ['ts','u','j','o']    → [['ts','u'], ['j','o']]
+         ['k','s','a']         → [['k'], ['s','a']]   (连续辅音拆开)
+    """
+    syllables = []
+    pending_cons = []
+    vowels = {'a', 'i', 'u', 'e', 'o', 'I', 'O', 'U'}
+    standalone = {'n', 'cl', 'ʔ', 'ɴ', 'N'}  # 拨音/促音/鼻音 → 独立音节
+
+    for ph in mapped_ph:
+        if ph in vowels:
+            syllables.append(pending_cons + [ph])
+            pending_cons = []
+        elif ph in standalone:
+            if pending_cons:
+                syllables.append(pending_cons)
+                pending_cons = []
+            syllables.append([ph])
+        else:
+            # 辅音：若已有待匹配辅音，先关闭它（日语音节最多一个辅音开头）
+            if pending_cons:
+                syllables.append(pending_cons)
+                pending_cons = []
+            pending_cons = [ph]
+
+    if pending_cons:
+        syllables.append(pending_cons)
+
+    return syllables
+
+
+def _syllable_to_token(syl):
+    """['w','a'] → 'jp_w-a', ['i'] → 'jp_i', ['n'] → 'jp_n'"""
+    return 'jp_' + '-'.join(syl)
+
+
 def _gtsinger_word_to_tokens(word_entry, min_dur=0.12):
     """将一个 GTSinger word 条目转换为 (phonemes, durations, note_pitches, note_types)。
 
     处理逻辑：
       - <AP> → <SP> token (note_pitch=0, type=1)
-      - 单 note: 合并所有音素为 jp_C-V 形式，一个 token
-      - 多 note (melisma): 按时序对齐音素到 note，每个 note 一个 token
-        无法对齐时回退为重复合并 token（首 note type=2，后续 type=3）
+      - 音素按日语音节切分（辅音+元音），每个音节一个 jp_C-V token
+        例: わらい (w-a-r-a-i) → jp_w-a, jp_r-a, jp_i (3 个 token)
+      - 单 note: 所有音节共享该 note 的 pitch，时长按音节均分
+      - 多 note (melisma): 按音素中点对齐到最近的 note，每组音素再切分成音节
     """
     ph_list = word_entry.get('ph', [])
     notes = word_entry.get('note', [0])
@@ -1148,30 +1196,29 @@ def _gtsinger_word_to_tokens(word_entry, min_dur=0.12):
     if not mapped_ph:
         return ['<SP>'], [max(float(note_dur[0]) if note_dur else 0.3, min_dur)], [0], [1]
 
-    # 构建 jp_ 前缀音素
-    jp_parts = []
-    for base_ph in mapped_ph:
-        jp_ph = PJS_PHONEME_MAP.get(base_ph, f'jp_{base_ph}')
-        if jp_ph == '<SP>':
-            continue
-        jp_parts.append(jp_ph)
+    # 切分成音节
+    syllables = _split_into_syllables(mapped_ph)
+    tokens = [_syllable_to_token(s) for s in syllables]
 
-    if not jp_parts:
+    if not tokens:
         return ['<SP>'], [max(float(note_dur[0]) if note_dur else 0.3, min_dur)], [0], [1]
 
-    # 合并 token: jp_{p1}-{p2}-...
-    def _merge(parts):
-        return 'jp_' + '-'.join(p[3:] for p in parts)
-
-    merged_token = _merge(jp_parts)
-
-    # 单 note
+    # 单 note: 所有音节共享该 note
     if len(notes) <= 1:
-        dur = float(note_dur[0]) if note_dur else 0.3
+        total_dur = float(note_dur[0]) if note_dur else 0.3
         pitch = int(notes[0]) if notes and notes[0] else 60
-        return [merged_token], [max(dur, min_dur)], [pitch], [2]
+        n_tok = len(tokens)
+        # 时长均分（保证每个至少 min_dur）
+        per = total_dur / n_tok if n_tok > 0 else total_dur
+        if per < min_dur:
+            durs = [min_dur] * n_tok
+        else:
+            durs = [per] * n_tok
+        pitches = [pitch] * n_tok
+        types = [2] * n_tok
+        return tokens, durs, pitches, types
 
-    # 多 note (melisma): 尝试按时序对齐音素到 note
+    # 多 note (melisma): 按音素中点对齐到最近的 note
     ph_starts = word_entry.get('ph_start', [])
     ph_ends = word_entry.get('ph_end', [])
     note_starts = word_entry.get('note_start', [])
@@ -1192,6 +1239,9 @@ def _gtsinger_word_to_tokens(word_entry, min_dur=0.12):
         for pi, ipa in enumerate(ph_list):
             if ipa == '<AP>':
                 continue
+            base = _gtsinger_map_phoneme(ipa)
+            if base == '<SP>':
+                continue
             ph_mid = (float(ph_starts[pi]) + float(ph_ends[pi])) / 2
             best_ni, best_dist = 0, float('inf')
             for ni in range(len(notes)):
@@ -1200,39 +1250,42 @@ def _gtsinger_word_to_tokens(word_entry, min_dur=0.12):
                 if dist < best_dist:
                     best_dist = dist
                     best_ni = ni
-            note_groups[best_ni].append(ipa)
+            note_groups[best_ni].append(base)
 
-        for ni, group_ipas in enumerate(note_groups):
-            if not group_ipas:
-                # 该 note 无对应音素 → 用合并 token 作为 slur
-                dur = float(note_dur[ni]) if ni < len(note_dur) else 0.3
-                phonemes_out.append(merged_token)
+        for ni, group_mapped in enumerate(note_groups):
+            dur = float(note_dur[ni]) if ni < len(note_dur) else 0.3
+            if not group_mapped:
+                # 该 note 无对应音素 → 用第一个音节 token 作为 slur
+                phonemes_out.append(tokens[0])
                 durations_out.append(max(dur, min_dur))
                 note_pitches_out.append(int(notes[ni]) if notes[ni] else 60)
                 note_types_out.append(3 if ni > 0 else 2)
                 continue
-            group_mapped = []
-            for ipa in group_ipas:
-                base = _gtsinger_map_phoneme(ipa)
-                if base == '<SP>':
-                    continue
-                group_mapped.append(base)
-            if not group_mapped:
-                group_jp = jp_parts
+            # 该 note 的音素再切分成音节
+            sub_syls = _split_into_syllables(group_mapped)
+            sub_tokens = [_syllable_to_token(s) for s in sub_syls]
+            n_sub = len(sub_tokens)
+            per = dur / n_sub if n_sub > 0 else dur
+            if per < min_dur:
+                sub_durs = [min_dur] * n_sub
             else:
-                group_jp = [PJS_PHONEME_MAP.get(b, f'jp_{b}') for b in group_mapped
-                            if PJS_PHONEME_MAP.get(b, f'jp_{b}') != '<SP>']
-            token = _merge(group_jp) if group_jp else merged_token
-            dur = float(note_dur[ni]) if ni < len(note_dur) else 0.3
-            phonemes_out.append(token)
-            durations_out.append(max(dur, min_dur))
-            note_pitches_out.append(int(notes[ni]) if notes[ni] else 60)
-            note_types_out.append(3 if ni > 0 else 2)
+                sub_durs = [per] * n_sub
+            for si, tok in enumerate(sub_tokens):
+                phonemes_out.append(tok)
+                durations_out.append(sub_durs[si])
+                note_pitches_out.append(int(notes[ni]) if notes[ni] else 60)
+                # 首 note 首音节 type=2，其余 type=3
+                note_types_out.append(2 if (ni == 0 and si == 0) else 3)
     else:
-        # 无法对齐 → 重复合并 token
+        # 无法对齐 → 按音节顺序分配到 notes
+        tok_idx = 0
         for ni, note in enumerate(notes):
             dur = float(note_dur[ni]) if ni < len(note_dur) else 0.3
-            phonemes_out.append(merged_token)
+            if tok_idx < len(tokens):
+                phonemes_out.append(tokens[tok_idx])
+                tok_idx += 1
+            else:
+                phonemes_out.append(tokens[0])
             durations_out.append(max(dur, min_dur))
             note_pitches_out.append(int(note) if note else 60)
             note_types_out.append(3 if ni > 0 else 2)
