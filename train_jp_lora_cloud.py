@@ -299,8 +299,9 @@ def _ensure_preprocess_files():
     # phone_set.json: 特殊 token + base_phones + jp 组合 token
     phone_set = _special_tokens + base_phones + jp_combined
 
-    # jp_phoneme_mapping.json: jp_ 音素 → base 音素
+    # jp_phoneme_mapping.json: jp_ 音素 → source base 音素
     mapping = {}
+    # 1) base JP 音素 (a/i/u/e/o/k/s/...)
     for jp in jp_phones:
         if jp in base_phones:
             mapping['jp_' + jp] = {
@@ -313,6 +314,30 @@ def _ensure_preprocess_files():
                 'init_weight': 0.5,
                 'strategy': 'fallback'
             }
+
+    # 2) 组合 JP 音素 (jp_C-V / jp_C / jp_V)，用组成 base 音素初始化
+    def _add_combo_mapping(token, source_phones):
+        valid_sources = []
+        total = 0.0
+        for sp, w in source_phones:
+            if sp in base_phones:
+                valid_sources.append({'phone': sp, 'weight': w})
+                total += w
+        if valid_sources:
+            if total > 0 and abs(total - 1.0) > 1e-6:
+                for s in valid_sources:
+                    s['weight'] /= total
+            mapping[token] = {'sources': valid_sources, 'init_weight': 1.0}
+
+    for c in jp_cons_list:
+        for v in jp_vowel_list:
+            _add_combo_mapping(f'jp_{c}-{v}', [(c, 0.5), (v, 0.5)])
+    for v in jp_vowel_list:
+        _add_combo_mapping(f'jp_{v}', [(v, 1.0)])
+    for c in jp_cons_list:
+        _add_combo_mapping(f'jp_{c}', [(c, 1.0)])
+    if 'jp_n' not in mapping:
+        _add_combo_mapping('jp_n', [('n', 1.0)])
 
     with open(_LOCAL_PREPROCESS_DIR + "/jp_phone_set.json", 'w') as f:
         json.dump(phone_set, f, ensure_ascii=False, indent=2)
