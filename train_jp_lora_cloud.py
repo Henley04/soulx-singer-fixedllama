@@ -3097,6 +3097,8 @@ def main():
                         help='不包含 GTSinger 数据集')
     parser.add_argument('--gtsinger_only', action='store_true',
                         help='仅使用 GTSinger 数据集（跳过 PJS/JSUT/JVS）')
+    parser.add_argument('--force_prepare', action='store_true',
+                        help='强制重新准备数据集（覆盖已有的 _preprocess 和 dataset 目录）')
     args = parser.parse_args()
 
     # 设备检测
@@ -3109,6 +3111,14 @@ def main():
     if args.dry_run:
         dry_run()
         return
+
+    # 强制重新准备：删除已有预处理/数据集目录
+    if args.force_prepare:
+        print('[force_prepare] 删除旧的预处理与数据集目录...')
+        for d in [_LOCAL_PREPROCESS_DIR, PREPARED_DATA_DIR]:
+            if os.path.isdir(d):
+                shutil.rmtree(d)
+                print(f'  已删除: {d}')
 
     # 验证源语言保护
     if args.verify_protection:
@@ -3163,7 +3173,7 @@ def main():
     print('=' * 60)
 
     # 1. 准备数据集
-    if not os.path.exists(os.path.join(PREPARED_DATA_DIR, 'metadata.json')):
+    if args.force_prepare or not os.path.exists(os.path.join(PREPARED_DATA_DIR, 'metadata.json')):
         print('\n[1/3] 准备数据集...')
         if args.gtsinger_only:
             prepare_datasets(
