@@ -52,15 +52,17 @@ LORA_ALPHA = 64
 # ===========================================================================
 # 原则：每个日语音素独立映射到单个最接近的英语音素，不考虑上下文。
 # ARPABET 无完全对应的（如 ts 塞擦音、拗音硬腭化）取主辅音近似。
-# 重音标记：日语无重音，元音统一用 1（主重音）作为英语代表音素。
+# 重音标记：日语是音高重音（pitch-accent）语言，无英语式的应力重音
+#   （stress-accent）。全标 1 会让 embedding 携带"重读"语义，污染条件
+#   特征。故元音统一用 0（无重音），与日语特性一致。
 # jp_cl（促音）和 jp_n（拨音）不在此表中——它们是新训练 token。
 JP_TO_BASE_PHONEME_MAP = {
-    # --- 五元音 ---
-    'jp_a':  'en_AA1',   # 开后不圆唇 [a]
-    'jp_i':  'en_IY1',   # 闭前不圆唇 [i]
-    'jp_u':  'en_UW1',   # 闭后（日语不圆唇 [ɯ]，英语圆唇 [u]，近似）
-    'jp_e':  'en_EH1',   # 半开前 [e]
-    'jp_o':  'en_OW1',   # 半开后圆唇 [o]
+    # --- 五元音（重音 0：日语无应力重音）---
+    'jp_a':  'en_AA0',   # 开后不圆唇 [a]
+    'jp_i':  'en_IY0',   # 闭前不圆唇 [i]
+    'jp_u':  'en_UW0',   # 闭后（日语不圆唇 [ɯ]，英语圆唇 [u]，近似）
+    'jp_e':  'en_EH0',   # 半开前 [e]
+    'jp_o':  'en_OW0',   # 半开后圆唇 [o]
     # --- 清辅音 ---
     'jp_k':  'en_K',     # [k]
     'jp_s':  'en_S',     # [s]
@@ -68,6 +70,8 @@ JP_TO_BASE_PHONEME_MAP = {
     'jp_h':  'en_HH',    # [h]（日语 [h] / [ç] / [ɸ] 变体，取 base [h]）
     'jp_p':  'en_P',     # [p]
     'jp_f':  'en_F',     # 日语双唇擦音 [ɸ] → 英语唇齿 [f]，近似
+                         # TODO(baseline后评估): [ɸ]与[f]发声位置差异大，
+                         # 若 fu 行听感差，升级为独立 token（参考 jp_n 正交初始化）
     'jp_ch': 'en_CH',    # [tʃ]
     'jp_sh': 'en_SH',    # [ʃ]
     'jp_ts': 'en_T',     # 塞擦音 [ts]，ARPABET 无对应，取塞音起始 [t]
@@ -80,15 +84,21 @@ JP_TO_BASE_PHONEME_MAP = {
     # --- 鼻音 / 近音 / 闪音 ---
     'jp_m':  'en_M',     # [m]
     'jp_r':  'en_L',     # 日语齿龈闪音 [ɾ] → 英语边音 [l]，近似
+                         # TODO(baseline后评估): [ɾ]与[l]频谱差异大，
+                         # 若 r 行听感差（大舌头/英语口音），升级为独立 token
     'jp_w':  'en_W',     # [w]
     'jp_y':  'en_Y',     # [j]
     # --- 拗音（硬腭化辅音）→ 取主辅音，丢失腭化色彩 ---
+    # 注意：评估建议加 Y 介音（kya→K+Y+AA0），但 en_ 多音素 note 会触发
+    # DataProcessor 的 <SEP> 插入（见 data_processor.py L97），而日语推理路径
+    # 不加 SEP（preprocessing.js L171），会导致训练-推理不一致。故保持 CV 两
+    # 音素，接受腭化丢失；接 i 系元音时元音可部分补偿。
     'jp_ky': 'en_K',     # [kʲ] → [k]
     'jp_gy': 'en_G',     # [gʲ] → [g]
     'jp_ny': 'en_N',     # 硬腭鼻音 [ɲ] → 齿龈鼻音 [n]，近似
     'jp_hy': 'en_HH',    # 清硬腭擦音 [ç] → 声门擦音 [h]，近似
     'jp_my': 'en_M',     # [mʲ] → [m]
-    'jp_ry': 'en_L',     # [ɾʲ] → [l]
+    'jp_ry': 'en_L',     # [ɾʲ] → [l]（同 jp_r 的 TODO）
     'jp_py': 'en_P',     # [pʲ] → [p]
     'jp_by': 'en_B',     # [bʲ] → [b]
 }
@@ -97,9 +107,9 @@ JP_TO_BASE_PHONEME_MAP = {
 # 键是 PJS lab 里的裸音素名（a/i/u/.../cl/n），值是 base token 或 jp_ 新 token
 PJS_RAW_TO_V2_TOKEN = {
     'pau': '<SP>', 'xx': '<SP>',
-    # 元音 → en_*
-    'a': 'en_AA1', 'i': 'en_IY1', 'u': 'en_UW1', 'e': 'en_EH1', 'o': 'en_OW1',
-    'I': 'en_AA1', 'O': 'en_OW1', 'U': 'en_UW1',
+    # 元音 → en_*（重音 0：日语无应力重音，见上方说明）
+    'a': 'en_AA0', 'i': 'en_IY0', 'u': 'en_UW0', 'e': 'en_EH0', 'o': 'en_OW0',
+    'I': 'en_AA0', 'O': 'en_OW0', 'U': 'en_UW0',
     # 辅音 → en_*
     'k': 'en_K', 's': 'en_S', 't': 'en_T', 'h': 'en_HH',
     'm': 'en_M', 'r': 'en_L', 'w': 'en_W', 'y': 'en_Y',
@@ -237,8 +247,7 @@ def forced_align_from_durations(
     在每个 note 内按音素类型（元音/辅音/促音/拨音）的统计时长比例分配帧。
     比 v1 的均匀分配更符合语音学：辅音短、元音长。
     """
-    VOWELS = {'en_AA1', 'en_IY1', 'en_UW1', 'en_EH1', 'en_OW1',
-              'en_AA0', 'en_IY0', 'en_UW0', 'en_EH0', 'en_OW0'}
+    VOWELS = {'en_AA0', 'en_IY0', 'en_UW0', 'en_EH0', 'en_OW0'}
     aligned = []
     frame_cursor = 0
     for phs, note_dur in zip(phonemes_per_note, note_durations):
@@ -383,6 +392,11 @@ def init_jp_embeddings_v2(model, phoneset_path: str):
     print(f"  [v2] Embedding table: {embed_weight.shape}")
 
     # jp_cl ← <SP> 均值 + 小噪声
+    # 注意：促音在日语长音高场景下需保持前一个音的 F0 走势，不能直接掉到 0。
+    # 本架构 f0 来自 wav 提取（非预测），训练时 f0 曲线天然含促音段的 F0；
+    # 但推理时需检查 f0_encoder 对 jp_cl 帧的输出是否合理。
+    # TODO(运行时检查): 跑通 baseline 后，检查含促音样本的 F0 曲线在 jp_cl
+    # 帧处是否平滑继承前音音高，若掉 0 则需在 f0 后处理或 jp_cl 初始化调整。
     sp_idx = phone2idx.get('<SP>')
     if sp_idx is not None:
         cl_vec = embed_weight[sp_idx].clone()
@@ -618,8 +632,8 @@ def lab_phonemes_to_notes_v2(
                 best_dist, best_idx = dist, si
 
         if best_idx == -1:
-            # 无重叠音节 → 兜底 en_AA1（v1 用 jp_a，v2 映射为 en_AA1）
-            phonemes.append('en_AA1')
+            # 无重叠音节 → 兜底 en_AA0（v1 用 jp_a，v2 映射为 en_AA0）
+            phonemes.append('en_AA0')
             durations.append(max(note_duration, min_dur))
             note_pitches.append(note_pitch)
             note_types.append(2)
