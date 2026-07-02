@@ -89,10 +89,13 @@ JP_TO_BASE_PHONEME_MAP = {
     'jp_w':  'en_W',     # [w]
     'jp_y':  'en_Y',     # [j]
     # --- 拗音（硬腭化辅音）→ 取主辅音，丢失腭化色彩 ---
-    # 注意：评估建议加 Y 介音（kya→K+Y+AA0），但 en_ 多音素 note 会触发
-    # DataProcessor 的 <SEP> 插入（见 data_processor.py L97），而日语推理路径
-    # 不加 SEP（preprocessing.js L171），会导致训练-推理不一致。故保持 CV 两
-    # 音素，接受腭化丢失；接 i 系元音时元音可部分补偿。
+    # 设计权衡：评估建议加 Y 介音（kya→en_K-en_Y-en_AA0）恢复腭化色彩。
+    # 技术上可行——v2 全程用 en_ 前缀，训练/推理都走 en_ 分支都加 <SEP>，
+    # 一致性 OK。但保持 CV 两音素的理由：
+    #   1. 三音素 note 的 mel2note 帧分配更紧，短 note 易帧不足
+    #   2. <SEP> 语义是英语词内音素分隔，日语 CV 音节加 <SEP> 可能引入噪声
+    #   3. 接 i 系元音时元音可部分补偿腭化色彩
+    # 若 baseline 听感显示拗音丢失严重，可重新启用 Y 介音方案。
     'jp_ky': 'en_K',     # [kʲ] → [k]
     'jp_gy': 'en_G',     # [gʲ] → [g]
     'jp_ny': 'en_N',     # 硬腭鼻音 [ɲ] → 齿龈鼻音 [n]，近似
