@@ -325,10 +325,10 @@ JSUT_DIR = _dataset_path + "/JSUT" if os.path.isdir(_dataset_path + "/JSUT") els
 JVS_PREPARED_DIR = _preprocess_path + "/dataset"  # JVS 预处理数据打包在预处理文件中（若不存在则跳过）
 
 # GTSinger 数据集路径（c2net 挂载路径下）
-# 支持两种目录结构：GTSinger/Japanese/... 或直接 Japanese/...
+# 支持目录结构：GTSinger-JP/Japanese/... 或 GTSinger/Japanese/... 或直接 Japanese/...
 GTSINGER_DIR = ""
 GTSINGER_JA_DIR = ""
-for _gts_root in [_dataset_path + "/GTSinger", _dataset_path]:
+for _gts_root in [_dataset_path + "/GTSinger-JP", _dataset_path + "/GTSinger", _dataset_path]:
     _gts_ja = os.path.join(_gts_root, "Japanese")
     if os.path.isdir(_gts_ja):
         GTSINGER_DIR = _gts_root
@@ -668,6 +668,9 @@ GTSINGER_PHONEME_MAP = {
     'ç': 'hy',    # 硬腭擦音 → hy（ひ）
     # 塞擦音
     'ts': 'ts', 'ch': 'ch',
+    'tɕ': 'ch',   # 清龈硬腭塞擦音 (ち/ち行) → ch
+    'dʑ': 'j',    # 浊龈硬腭塞擦音 (じ/じ行) → j (PJS 中 j 表示浊塞擦音)
+    'ɟ': 'g',     # 浊硬腭塞音 (g 的硬腭变体) → g
     # 鼻音
     'n': 'n', 'ɲ': 'ny',   # 硬腭鼻音 → ny（に）
     'm': 'm',
@@ -685,6 +688,7 @@ GTSINGER_PHONEME_MAP = {
     'ʔ': 'cl', 'cl': 'cl', 'Q': 'cl',
     # 停顿
     '<AP>': '<SP>',
+    '<SP>': '<SP>',   # GTSinger 短停顿 token (区别于 <AP> 气口)
 }
 
 
@@ -3073,6 +3077,11 @@ def main():
     print(f'  Checkpoints: {CHECKPOINT_DIR}')
     print(f'  数据集: {PREPARED_DATA_DIR}')
     print('=' * 60)
+
+    # 回传最终结果到云平台
+    print('\n[c2net] 上传最终输出到云存储...')
+    upload_output()
+    print('[c2net] 上传完成')
 
 
 if __name__ == '__main__':
