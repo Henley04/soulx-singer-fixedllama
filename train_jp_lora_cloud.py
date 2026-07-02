@@ -65,7 +65,8 @@ SEED = 42
 
 # DataLoader 并行加载：自动按 CPU 核数设置（留一半给主进程和 GPU 预处理）
 # 云端 A100 实例常见 8-24 vCPU，上限 8 避免小数据集下 worker 启动开销过大
-NUM_WORKERS = min(8, max(2, (os.cpu_count() or 4) // 2))
+# 延迟求值（import os 在下方），首次使用时计算
+NUM_WORKERS = None
 
 # 三阶段训练配置
 # 训练目标说明：
@@ -142,6 +143,10 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
+
+# 现在可安全调用 os.cpu_count()
+if NUM_WORKERS is None:
+    NUM_WORKERS = min(8, max(2, (os.cpu_count() or 4) // 2))
 
 # c2net 云平台接口（必须在所有其他逻辑之前初始化）
 from c2net.context import prepare, upload_output
