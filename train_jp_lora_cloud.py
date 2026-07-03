@@ -59,7 +59,10 @@ LORA_RANK = 32           # rank=32 提供更高容量用于 preflow 深度微调
 LORA_ALPHA = 64          # alpha = 2 * rank
 BATCH_SIZE = 8           # A100 40G（无 diff_estimator LoRA，显存充裕）
 GRADIENT_ACCUMULATION = 2  # 有效 batch = 16
-GRAD_CHECKPOINT = True
+GRAD_CHECKPOINT = False  # 关闭：diff_estimator 虽冻结，但 cond_emb 可训练时
+                         # 梯度需穿过 diff_estimator 回传。checkpointing 能省
+                         # 激活显存，但 A100 40G + batch_size=8 显存充裕（见 L60），
+                         # 重计算是纯速度开销。若显存不足可改 True。
 VAL_RATIO = 0.1
 SEED = 42
 
