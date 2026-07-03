@@ -23,7 +23,7 @@ lora.py / init_embeddings.py / dataset.py / train_lora.py / validate.py / export
 训练目标（按组件）：
   - note_text_encoder (embedding): 全量训练
       仅 JP phoneme 行（3000-3032）更新，base 行梯度置零保护源语言。
-  - preflow (encoder): LoRA 深度微调（rank=32, alpha=64）
+  - preflow (encoder): LoRA 深度微调（rank=64, alpha=128）
       4 层 ConvNeXtV2Block 的 pwconv1/pwconv2（8 个适配器）。
   - cond_emb (跨模态对齐层): 全量微调
       cfm_decoder.model.cond_emb Linear（EMBED_DIM→COND_DIM）直接更新权重。
@@ -70,8 +70,8 @@ https://www.modelscope.cn/datasets/aihobbyist/StarRail_Dataset/resolve/master/St
 
 # LoRA 超参数（A100 40G 最佳实践）
 # 仅 preflow (encoder) 采用 LoRA 深度微调；cond_emb 全量微调；diff_estimator 不微调
-LORA_RANK = 32           # rank=32 提供更高容量用于 preflow 深度微调
-LORA_ALPHA = 64          # alpha = 2 * rank
+LORA_RANK = 64           # 原 32 跨语言适配容量不足，提升到 64（参数 0.39M→1.57M）
+LORA_ALPHA = 128         # alpha = 2 * rank
 BATCH_SIZE = 8           # A100 40G（无 diff_estimator LoRA，显存充裕）
 GRADIENT_ACCUMULATION = 2  # 有效 batch = 16
 GRAD_CHECKPOINT = True   # 恢复：GTSinger 2832 样本含长音频，关闭 checkpoint 导致
@@ -143,7 +143,7 @@ COND_DIM = 1024
 MEL_DIM = 128
 SAMPLE_RATE = 24000
 HOP_SIZE = 480
-NOISE_SCALE = 0.3  # v3: cos ~ 0.96，保留语音学相似性
+NOISE_SCALE = 0.1  # 原 0.3 导致实际 cos=0.7071 远低于 target 0.96，扰动过大破坏语义相似性
 NUM_PREFLOW_BLOCKS = 4
 
 # ===========================================================================
