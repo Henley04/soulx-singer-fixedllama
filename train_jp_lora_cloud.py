@@ -2334,10 +2334,30 @@ def _restore_partial_optimizer_state(optimizer, opt_state, cur_groups, saved_gro
         for spid, cpid in zip(saved_pids, cur_pids):
             if spid in saved_state:
                 # 手动注入 Adam 动量到 optimizer.state
-                optimizer.state[cpid] = {
-                    k: v.clone() if torch.is_tensor(v) else v
-                    for k, v in saved_state[spid].items()
-                }
+                # 关键：saved_state 来自 torch.load(map_location='cpu')，动量张量在 CPU。
+                # 必须移到当前参数的设备，否则 optimizer.step() 会触发
+                # "Expected all tensors to be on the same device" 错误。
+                cur_param = optimizer.state.get(cpid)
+                # 从 cur_g 的 params 中找到对应参数张量获取设备
+                # （cpid 是 param id，需通过 optimizer.param_groups 查找）
+                target_device = None
+                for pg in optimizer.param_groups:
+                    for p in pg['params']:
+                        if id(p) == cpid:
+                            target_device = p.device
+                            break
+                    if target_device is not None:
+                        break
+                new_state = {}
+                for k, v in saved_state[spid].items():
+                    if torch.is_tensor(v):
+                        v_out = v.clone()
+                        if target_device is not None and v_out.device != target_device:
+                            v_out = v_out.to(target_device)
+                        new_state[k] = v_out
+                    else:
+                        new_state[k] = v
+                optimizer.state[cpid] = new_state
                 restored_count += 1
     print(f"  Restored Adam momentum for {restored_count} params by name matching")
 
@@ -2354,6 +2374,10 @@ def restore_optimizer_state_by_name(optimizer, resume_path):
     对于 embed 组：若 load_checkpoint 替换了 nn.Embedding，saved 的 Adam 动量
     仍可恢复到新张量（动量描述的是梯度历史，权重数据本身已从 checkpoint 加载，
     新旧张量的梯度统计在数据分布一致时近似有效）。
+
+    始终走 partial 路径：即使 groups 数相同，也手动恢复以保证设备正确
+    （saved_state 在 CPU，optimizer.load_state_dict 不会自动转设备，
+    直接使用会触发 "Expected all tensors to be on the same device" 错误）。
     """
     if not os.path.exists(resume_path):
         print(f"  [OptState] {resume_path} 不存在，跳过 optimizer state 恢复")
@@ -2365,16 +2389,9 @@ def restore_optimizer_state_by_name(optimizer, resume_path):
         return
     cur_groups = optimizer.param_groups
     saved_groups = opt_state.get('param_groups', [])
-    if len(saved_groups) == len(cur_groups):
-        try:
-            optimizer.load_state_dict(opt_state)
-            print(f"  [OptState] 完整恢复 optimizer state "
-                  f"(groups={len(cur_groups)})")
-            return
-        except Exception as e:
-            print(f"  [OptState] 完整恢复失败 ({e})，尝试按 name 部分恢复")
+    # 始终走 partial 路径以正确处理设备转换
     _restore_partial_optimizer_state(optimizer, opt_state, cur_groups, saved_groups)
-    print(f"  [OptState] 部分恢复 optimizer state "
+    print(f"  [OptState] 恢复 optimizer state "
           f"(saved_groups={len(saved_groups)} -> cur_groups={len(cur_groups)})")
 
 
