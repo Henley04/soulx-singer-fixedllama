@@ -2337,17 +2337,10 @@ def _restore_partial_optimizer_state(optimizer, opt_state, cur_groups, saved_gro
                 # 关键：saved_state 来自 torch.load(map_location='cpu')，动量张量在 CPU。
                 # 必须移到当前参数的设备，否则 optimizer.step() 会触发
                 # "Expected all tensors to be on the same device" 错误。
-                cur_param = optimizer.state.get(cpid)
-                # 从 cur_g 的 params 中找到对应参数张量获取设备
-                # （cpid 是 param id，需通过 optimizer.param_groups 查找）
-                target_device = None
-                for pg in optimizer.param_groups:
-                    for p in pg['params']:
-                        if id(p) == cpid:
-                            target_device = p.device
-                            break
-                    if target_device is not None:
-                        break
+                # cpid 是当前 optimizer.param_groups 中的张量对象本身，
+                # 直接用 .device 获取目标设备（不能用 id(p)==cpid 比较，
+                # 因为 cpid 是 tensor，int==tensor 会触发 ambiguous bool）。
+                target_device = cpid.device if hasattr(cpid, 'device') else None
                 new_state = {}
                 for k, v in saved_state[spid].items():
                     if torch.is_tensor(v):
