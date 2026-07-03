@@ -2918,7 +2918,7 @@ def build_full_embedding(ft_ckpt, base_ckpt):
 
 
 def export_onnx_files(checkpoint_path, device='cpu'):
-    """导出 4 个 ONNX 文件 + merged_model.pt。"""
+    """导出 4 个 ONNX 文件 + lora_adapter.pt（仅适配器，不含基础模型权重）。"""
     if not _TORCH_AVAILABLE:
         raise ImportError("torch is required for ONNX export")
 
@@ -3077,18 +3077,29 @@ def export_onnx_files(checkpoint_path, device='cpu'):
             opset_version=opset, do_constant_folding=True)
     print(f'  {diff_path}: {os.path.getsize(diff_path) / 1024 / 1024:.2f} MB')
 
-    # 5. merged_model.pt
-    print('\n保存 merged_model.pt...')
-    merged_path = os.path.join(ONNX_OUTPUT_DIR, 'merged_model.pt')
-    save_obj = {
-        'state_dict': model.state_dict(),
-        'description': 'v3 JP fine-tuned model (preflow LoRA merged + cond_emb full + JP embed; diff_estimator frozen)',
+    # 5. lora_adapter.pt（仅适配器，不含基础模型权重）
+    # 体积小（几十 MB），可分享/加载到基础模型上；与 save_checkpoint 的格式一致
+    print('\n保存 lora_adapter.pt（仅适配器，不含基础模型权重）...')
+    adapter_path = os.path.join(ONNX_OUTPUT_DIR, 'lora_adapter.pt')
+    adapter_obj = {
+        'lora_state': ft_ckpt.get('lora_state', {}),
+        'embed_weight': ft_ckpt.get('embed_weight'),
+        'jp_embed': ft_ckpt.get('jp_embed'),
+        'cond_emb_state': ft_ckpt.get('cond_emb_state'),
+        'jp_phoneme_start': JP_PHONEME_START,
+        'jp_phoneme_count': JP_PHONEME_COUNT,
+        'lora_rank': LORA_RANK,
+        'lora_alpha': LORA_ALPHA,
+        'diff_lora_rank': DIFF_LORA_RANK,
+        'diff_lora_alpha': DIFF_LORA_ALPHA,
+        'diff_lora_last_layers': DIFF_LORA_LAST_LAYERS,
+        'description': 'v3 JP LoRA adapter (preflow + diff_estimator LoRA + JP embed + cond_emb full)',
         'epoch': ft_ckpt.get('epoch'),
         'stage': ft_ckpt.get('stage'),
         'loss': ft_ckpt.get('loss'),
     }
-    torch.save(save_obj, merged_path)
-    print(f'  {merged_path}: {os.path.getsize(merged_path) / 1024 / 1024:.2f} MB')
+    torch.save(adapter_obj, adapter_path)
+    print(f'  {adapter_path}: {os.path.getsize(adapter_path) / 1024 / 1024:.2f} MB')
 
     # 清理过时的 note_pitch_encoder.onnx
     stale_pitch = os.path.join(ONNX_OUTPUT_DIR, 'note_pitch_encoder.onnx')
