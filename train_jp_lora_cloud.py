@@ -2197,12 +2197,15 @@ def multi_resolution_spectral_loss(pred, target, mask, device):
     """
     pred = pred * mask
     target = target * mask
-    # 转为 (B, mel_dim, T) 在时间轴做 STFT
-    pred_t = pred.transpose(1, 2)
-    target_t = target.transpose(1, 2)
+    # 转为 (B*mel_dim, T) 在时间轴做 STFT（torch.stft 仅接受 1D/2D）
+    B, T, mel_dim = pred.shape
+    pred_t = pred.transpose(1, 2).reshape(B * mel_dim, T)
+    target_t = target.transpose(1, 2).reshape(B * mel_dim, T)
     total = 0.0
     configs = [(256, 64), (512, 128), (1024, 256)]
     for n_fft, hop in configs:
+        if T < n_fft:
+            continue
         win = torch.hann_window(n_fft, device=device)
         pred_stft = torch.stft(pred_t, n_fft=n_fft, hop_length=hop,
                                win_length=n_fft, window=win, return_complex=True,
@@ -2217,7 +2220,7 @@ def multi_resolution_spectral_loss(pred, target, mask, device):
         # log spectral loss
         log_sc = F.l1_loss(torch.log(pred_mag), torch.log(target_mag))
         total = total + sc + log_sc
-    return total / len(configs)
+    return total / max(len(configs), 1)
 
 
 def compute_flow_loss(model, target_mel, x_mask, mel_feat,
