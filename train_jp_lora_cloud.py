@@ -2223,7 +2223,13 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, epoch, writ
 @torch.no_grad()
 def validate(model, dataloader, device, epoch, writer, stage,
              use_prompt_split, prompt_split_prob, amp_dtype):
-    """验证（flow-matching 损失）。"""
+    """验证（flow-matching 损失）。
+
+    验证时强制不使用 prompt split（use_prompt_split=False）：
+    prompt split 在训练时用 torch.rand 随机化，若验证也用随机 split，
+    val_loss 会在 28-37 间剧烈波动（日志可见），导致 early stop 判断不可靠。
+    验证应评估模型在标准（完整序列）任务上的表现，保证指标稳定可复现。
+    """
     model.eval()
     total_loss = 0.0
     n = 0
@@ -2237,9 +2243,10 @@ def validate(model, dataloader, device, epoch, writer, stage,
         try:
             with amp_context(device, enabled=use_amp, dtype=amp_dtype):
                 target_mel, x_mask, mel_feat = extract_features(model, batch, device)
+                # 验证时强制不 split，保证 val_loss 稳定
                 loss = compute_flow_loss(
                     model, target_mel, x_mask, mel_feat,
-                    use_prompt_split, prompt_split_prob, device)
+                    False, 0.0, device)
             total_loss += loss.item()
             n += 1
         except RuntimeError as e:
@@ -2425,7 +2432,9 @@ def load_checkpoint(model, optimizer, resume_path, stage):
             new_emb.weight.data = ew.to(device)
             model.note_text_encoder = new_emb
         else:
-            model.note_text_encoder.weight.data[:ew.shape[0]] = ew
+            # 用 copy_ 替代切片赋值：copy_ 会自动转设备，
+            # 直接 data[:n] = ew 在 ew 为 CPU、weight 为 GPU 时会报设备不匹配
+            model.note_text_encoder.weight.data[:ew.shape[0]].copy_(ew)
     lora_state = ckpt.get('lora_state', {})
     loaded = 0
     if lora_state:
@@ -2451,19 +2460,14 @@ def load_checkpoint(model, optimizer, resume_path, stage):
     if optimizer is not None and ckpt.get('optimizer_state') is not None:
         try:
             opt_state = ckpt['optimizer_state']
-            # 跨阶段恢复：尝试匹配参数组，跳过新增/移除的分组
-            # （stage1 可能只有 embed+cond_emb，stage2 新增 LoRA 组）
             cur_groups = optimizer.param_groups
             saved_groups = opt_state.get('param_groups', [])
-            if len(saved_groups) == len(cur_groups):
-                optimizer.load_state_dict(opt_state)
-                print(f"  Restored optimizer state (stage {ckpt.get('stage')}->{stage})")
-            else:
-                # 分组数不一致（跨阶段新增 LoRA 组）：仅恢复可匹配的 Adam 动量
-                _restore_partial_optimizer_state(optimizer, opt_state, cur_groups, saved_groups)
-                print(f"  Partially restored optimizer state "
-                      f"(stage {ckpt.get('stage')}->{stage}, "
-                      f"groups {len(saved_groups)}->{len(cur_groups)})")
+            # 始终走 partial 路径：optimizer.load_state_dict 不会自动转设备，
+            # saved_state 在 CPU，直接 load 会导致 optimizer.step() 报设备不匹配
+            _restore_partial_optimizer_state(optimizer, opt_state, cur_groups, saved_groups)
+            print(f"  Restored optimizer state "
+                  f"(stage {ckpt.get('stage')}->{stage}, "
+                  f"groups {len(saved_groups)}->{len(cur_groups)})")
         except Exception as e:
             print(f"  Skip optimizer state: {e}")
     epoch_start = ckpt.get('epoch', 0) + 1
