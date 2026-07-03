@@ -72,6 +72,12 @@ https://www.modelscope.cn/datasets/aihobbyist/StarRail_Dataset/resolve/master/St
 # 仅 preflow (encoder) 采用 LoRA 深度微调；cond_emb 全量微调；diff_estimator 不微调
 LORA_RANK = 64           # 原 32 跨语言适配容量不足，提升到 64（参数 0.39M→1.57M）
 LORA_ALPHA = 128         # alpha = 2 * rank
+# diff_estimator (DiffLlama) 最后 N 层 attention 的 LoRA 配置
+# 原 diff_estimator 完全冻结，现对最后 2 层 q/k/v/o_proj 注入 LoRA
+# 增加约 0.2M 参数，在源语言保护和日语高频摩擦音适配间折中
+DIFF_LORA_RANK = 16      # 较小 rank：hidden_size=1024，仅微调 attention 投影
+DIFF_LORA_ALPHA = 32     # alpha = 2 * rank
+DIFF_LORA_LAST_LAYERS = 2  # 仅解冻最后 2 层（共 16 层）
 BATCH_SIZE = 8           # A100 40G（无 diff_estimator LoRA，显存充裕）
 GRADIENT_ACCUMULATION = 2  # 有效 batch = 16
 GRAD_CHECKPOINT = True   # 恢复：GTSinger 2832 样本含长音频，关闭 checkpoint 导致
@@ -128,8 +134,11 @@ STAGE_CONFIGS = {
         'train_cond_emb': True,
         'warmup_steps': 100,
         'use_prompt_split': True,
-        'prompt_split_prob': 1.0,
+        # 原 1.0 强制 100% 切分破坏歌唱韵律连贯性，降到 0.3
+        'prompt_split_prob': 0.3,
         'prompt_split_start_ep': 1,
+        # 多分辨率频谱损失：弥补 Flow Matching 高频过平滑（日语清音 s/sh/h）
+        'spectral_loss_weight': 0.1,
     },
 }
 
@@ -1607,19 +1616,22 @@ def _define_lora_linear():
     return LoRALinear
 
 
-def apply_lora_to_model(model, rank=32, alpha=64):
-    """将 preflow 的目标 Linear 替换为 LoRALinear。
+def apply_lora_to_model(model, rank=32, alpha=64,
+                        diff_rank=DIFF_LORA_RANK, diff_alpha=DIFF_LORA_ALPHA,
+                        diff_last_layers=DIFF_LORA_LAST_LAYERS):
+    """将 preflow 和 diff_estimator 最后几层 attention 注入 LoRA。
 
-    训练目标分配（按用户要求）：
-      - preflow (encoder): LoRA 深度微调 ← 仅此部分注入 LoRA
-      - cond_emb (跨模态对齐层): 全量微调，不注入 LoRA（直接训练原始权重）
-      - diff_estimator (diffstep): 冻结，不注入 LoRA
+    训练目标分配：
+      - preflow (encoder): LoRA 深度微调（rank=64, 4 层 ConvNeXtV2Block）
+      - diff_estimator (DiffLlama): 最后 2 层 self_attn q/k/v/o_proj 注入 LoRA（rank=16）
+        原 diff_estimator 完全冻结，现部分解冻以适配日语高频摩擦音等声学特征
+      - cond_emb (跨模态对齐层): 全量微调，不注入 LoRA
       - note_text_encoder (embedding): 全量训练，不注入 LoRA
     """
     LoRALinear = _define_lora_linear()
     replaced = []
 
-    # preflow: 4 个 ConvNeXtV2Block（仅此处注入 LoRA）
+    # preflow: 4 个 ConvNeXtV2Block
     for i, block in enumerate(model.preflow):
         for attr in ("pwconv1", "pwconv2"):
             original = getattr(block, attr)
@@ -1629,30 +1641,54 @@ def apply_lora_to_model(model, rank=32, alpha=64):
             setattr(block, attr, lora)
             replaced.append((block, attr, lora))
 
-    # cond_emb: 全量微调，不注入 LoRA（在 apply_lora_and_setup_trainable 中设 requires_grad=True）
-    # diff_estimator: 冻结，不注入 LoRA
+    # diff_estimator: 最后 N 层 self_attn 的 q/k/v/o_proj
+    diff_estimator = model.cfm_decoder.model.diff_estimator
+    n_layers = len(diff_estimator.layers)
+    start_idx = max(0, n_layers - diff_last_layers)
+    for i in range(start_idx, n_layers):
+        attn = diff_estimator.layers[i].self_attn
+        for attr in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            original = getattr(attn, attr, None)
+            if original is None or not isinstance(original, nn.Linear):
+                continue
+            lora = LoRALinear(original, rank=diff_rank, alpha=diff_alpha)
+            setattr(attn, attr, lora)
+            replaced.append((attn, attr, lora))
+
     return replaced
 
 
 def merge_lora_into_base(model):
-    """将 preflow 的 LoRA 增量合并回基础 Linear 权重（in-place）。
+    """将 preflow 和 diff_estimator 的 LoRA 增量合并回基础 Linear 权重（in-place）。
 
-    注意：cond_emb 为全量微调，无需合并；diff_estimator 未微调，无需合并。
+    注意：cond_emb 为全量微调，无需合并。
     """
     LoRALinear = _define_lora_linear()
+
+    def _merge_one(parent, attr):
+        layer = getattr(parent, attr, None)
+        if isinstance(layer, LoRALinear):
+            merged_lin = nn.Linear(
+                layer.original.in_features, layer.original.out_features,
+                bias=layer.original.bias is not None)
+            with torch.no_grad():
+                merged_lin.weight.copy_(layer.merged_weight())
+                if layer.original.bias is not None:
+                    merged_lin.bias.copy_(layer.original.bias)
+            merged_lin.to(layer.original.weight.device)
+            setattr(parent, attr, merged_lin)
+
+    # preflow
     for block in model.preflow:
         for attr in ("pwconv1", "pwconv2"):
-            layer = getattr(block, attr)
-            if isinstance(layer, LoRALinear):
-                merged_lin = nn.Linear(
-                    layer.original.in_features, layer.original.out_features,
-                    bias=layer.original.bias is not None)
-                with torch.no_grad():
-                    merged_lin.weight.copy_(layer.merged_weight())
-                    if layer.original.bias is not None:
-                        merged_lin.bias.copy_(layer.original.bias)
-                merged_lin.to(layer.original.weight.device)
-                setattr(block, attr, merged_lin)
+            _merge_one(block, attr)
+
+    # diff_estimator: 所有层的 self_attn q/k/v/o_proj
+    diff_estimator = model.cfm_decoder.model.diff_estimator
+    for layer in diff_estimator.layers:
+        attn = layer.self_attn
+        for attr in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            _merge_one(attn, attr)
 
 
 def count_trainable_params(model) -> int:
@@ -1937,7 +1973,8 @@ def apply_lora_structure(model, stage):
     导致 hook 注册在即将被丢弃的 OLD 张量上。
     """
     replaced = apply_lora_to_model(model, rank=LORA_RANK, alpha=LORA_ALPHA)
-    print(f"  Applied LoRA (rank={LORA_RANK}, alpha={LORA_ALPHA}) to {len(replaced)} preflow layers")
+    print(f"  Applied LoRA (preflow rank={LORA_RANK}, diff_estimator rank={DIFF_LORA_RANK}) "
+          f"to {len(replaced)} layers")
     return replaced
 
 
@@ -1949,26 +1986,26 @@ def setup_trainable_and_hooks(model, stage):
 
     训练目标分配：
       - preflow (encoder): LoRA 深度微调（按 stage 配置开关）
+      - diff_estimator (DiffLlama): 最后 2 层 attention LoRA 微调（跟随 train_lora 开关）
       - cond_emb (跨模态对齐层): 全量微调（按 stage 配置开关）
       - note_text_encoder (embedding): 全量训练（仅 JP 行，base 行梯度置零）
-      - diff_estimator (diffstep): 始终冻结
       - vocoder / f0_encoder / note_pitch_encoder / note_type_encoder: 始终冻结
     """
     for param in model.parameters():
         param.requires_grad = False
     cfg = STAGE_CONFIGS[stage]
 
-    # preflow LoRA
+    # preflow + diff_estimator LoRA（统一开关：lora_A/lora_B 参数）
     if cfg['train_lora']:
         for name, param in model.named_parameters():
             if 'lora_A' in name or 'lora_B' in name:
                 param.requires_grad = True
-        print(f"  Stage {stage}: preflow LoRA 适配器可训练")
+        print(f"  Stage {stage}: preflow + diff_estimator LoRA 适配器可训练")
     else:
         for name, param in model.named_parameters():
             if 'lora_A' in name or 'lora_B' in name:
                 param.requires_grad = False
-        print(f"  Stage {stage}: preflow LoRA 适配器冻结（B=0 no-op）")
+        print(f"  Stage {stage}: preflow + diff_estimator LoRA 适配器冻结（B=0 no-op）")
 
     # cond_emb 全量微调（跨模态对齐层）
     cond_parent = model.cfm_decoder.model
@@ -2151,9 +2188,42 @@ def extract_features(model, batch, device):
     return target_mel, x_mask, mel_feat
 
 
+def multi_resolution_spectral_loss(pred, target, mask, device):
+    """多分辨率频谱损失（在 mel 域时间轴上计算 STFT）。
+
+    弥补 Flow Matching MSE 在高频细节（日语清音 s/sh/h）上的过平滑。
+    pred, target: (B, T, mel_dim)
+    mask: (B, T, 1)
+    """
+    pred = pred * mask
+    target = target * mask
+    # 转为 (B, mel_dim, T) 在时间轴做 STFT
+    pred_t = pred.transpose(1, 2)
+    target_t = target.transpose(1, 2)
+    total = 0.0
+    configs = [(256, 64), (512, 128), (1024, 256)]
+    for n_fft, hop in configs:
+        win = torch.hann_window(n_fft, device=device)
+        pred_stft = torch.stft(pred_t, n_fft=n_fft, hop_length=hop,
+                               win_length=n_fft, window=win, return_complex=True,
+                               normalized=True)
+        target_stft = torch.stft(target_t, n_fft=n_fft, hop_length=hop,
+                                 win_length=n_fft, window=win, return_complex=True,
+                                 normalized=True)
+        pred_mag = pred_stft.abs().clamp(min=1e-7)
+        target_mag = target_stft.abs().clamp(min=1e-7)
+        # spectral convergence (Frobenius 范数比)
+        sc = torch.norm(target_mag - pred_mag, p='fro') / torch.norm(target_mag, p='fro').clamp(min=1e-7)
+        # log spectral loss
+        log_sc = F.l1_loss(torch.log(pred_mag), torch.log(target_mag))
+        total = total + sc + log_sc
+    return total / len(configs)
+
+
 def compute_flow_loss(model, target_mel, x_mask, mel_feat,
-                      use_prompt_split, prompt_split_prob, device):
-    """计算 flow-matching 损失。"""
+                      use_prompt_split, prompt_split_prob, device,
+                      spectral_loss_weight=0.0):
+    """计算 flow-matching 损失（可选多分辨率频谱损失）。"""
     B, T, _ = target_mel.shape
     do_split = use_prompt_split and (torch.rand(1).item() < prompt_split_prob)
     if do_split:
@@ -2166,12 +2236,19 @@ def compute_flow_loss(model, target_mel, x_mask, mel_feat,
     sigma = model.cfm_decoder.model.sigma
     flow_target = x - (1 - sigma) * noise
     loss = ((flow_pred - flow_target) ** 2 * final_mask).sum() / final_mask.sum().clamp(min=1)
+
+    # 多分辨率频谱损失：从 flow_pred 反推 predicted_x0 = flow_pred + (1-sigma)*noise
+    if spectral_loss_weight > 0:
+        predicted_x0 = flow_pred + (1 - sigma) * noise
+        spec_loss = multi_resolution_spectral_loss(predicted_x0, target_mel, final_mask, device)
+        loss = loss + spectral_loss_weight * spec_loss
     return loss
 
 
 def train_one_epoch(model, dataloader, optimizer, scheduler, device, epoch, writer,
                     stage, use_prompt_split, prompt_split_prob,
-                    gradient_accumulation, amp_dtype, global_step):
+                    gradient_accumulation, amp_dtype, global_step,
+                    spectral_loss_weight=0.0):
     """训练一个 epoch。"""
     model.train()
     total_loss = 0.0
@@ -2192,7 +2269,8 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, epoch, writ
                 target_mel, x_mask, mel_feat = extract_features(model, batch, device)
                 loss = compute_flow_loss(
                     model, target_mel, x_mask, mel_feat,
-                    use_prompt_split, prompt_split_prob, device)
+                    use_prompt_split, prompt_split_prob, device,
+                    spectral_loss_weight=spectral_loss_weight)
                 loss_scaled = loss / gradient_accumulation
             loss_scaled.backward()
             if (bi + 1) % gradient_accumulation == 0:
@@ -2202,7 +2280,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, epoch, writ
                 if embed_w.grad is not None:
                     last_embed_grad_norm = embed_w.grad.norm().item()
                 torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad], max_norm=1.0)
+                    [p for p in model.parameters() if p.requires_grad], max_norm=3.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 if scheduler is not None:
@@ -2647,7 +2725,8 @@ def train_one_stage(stage, init_embed_path=None, resume_path=None, device='cuda'
         avg_loss, global_step = train_one_epoch(
             model, train_dataloader, optimizer, scheduler, device,
             epoch, writer, stage, use_ps, ps_prob,
-            GRADIENT_ACCUMULATION, amp_dtype, global_step)
+            GRADIENT_ACCUMULATION, amp_dtype, global_step,
+            spectral_loss_weight=cfg.get('spectral_loss_weight', 0.0))
         elapsed = time.time() - t0
         print(f'Epoch {epoch}/{epoch_end} loss={avg_loss:.4f} '
               f'time={elapsed:.1f}s split={use_ps}(p={ps_prob})')
@@ -2900,7 +2979,7 @@ def export_onnx_files(checkpoint_path, device='cpu'):
             module.lora_A.data.copy_(ls['lora_A'])
             module.lora_B.data.copy_(ls['lora_B'])
             loaded += 1
-    print(f'  Loaded LoRA state for {loaded} preflow layers')
+    print(f'  Loaded LoRA state for {loaded} layers (preflow + diff_estimator)')
 
     # 加载 cond_emb 全量微调权重（跨模态对齐层）
     cond_emb_state = ft_ckpt.get('cond_emb_state', {})
@@ -3109,7 +3188,7 @@ def verify_source_language_protection(checkpoint_path=None):
                 module.lora_A.data.copy_(ls['lora_A'])
                 module.lora_B.data.copy_(ls['lora_B'])
                 loaded += 1
-        print(f'  Loaded LoRA state for {loaded} preflow layers')
+        print(f'  Loaded LoRA state for {loaded} layers (preflow + diff_estimator)')
 
         # 加载 cond_emb 全量微调权重
         cond_emb_state = ft_ckpt.get('cond_emb_state', {})
@@ -3281,14 +3360,20 @@ def dry_run():
 
             model = _DummyModel(64, 64)
             replaced = apply_lora_to_model(model, rank=LORA_RANK, alpha=LORA_ALPHA)
-            print(f'  注入 LoRA: {len(replaced)} 个适配器（仅 preflow）')
+            print(f'  注入 LoRA: {len(replaced)} 个适配器（preflow + diff_estimator 最后2层）')
             preflow_n = sum(1 for _, attr, _ in replaced if attr in ('pwconv1', 'pwconv2'))
             cond_n = sum(1 for _, attr, _ in replaced if attr == 'cond_emb')
             attn_n = sum(1 for _, attr, _ in replaced if attr in ('q_proj', 'k_proj', 'v_proj', 'o_proj'))
-            print(f'    preflow: {preflow_n}, cond_emb: {cond_n} (应为0，全量微调), DiffLlama attn: {attn_n} (应为0，冻结)')
-            # 验证：仅 preflow 有 LoRA，cond_emb 和 diff_estimator 无 LoRA
-            if cond_n != 0 or attn_n != 0:
-                print(f'  [FAIL] cond_emb 或 diff_estimator 被错误注入 LoRA')
+            # _DummyDiffEstimator 有 2 层，DIFF_LORA_LAST_LAYERS=2，全部注入：2层×4投影=8
+            expected_attn = DIFF_LORA_LAST_LAYERS * 4
+            print(f'    preflow: {preflow_n}, cond_emb: {cond_n} (应为0，全量微调), '
+                  f'DiffLlama attn: {attn_n} (应为{expected_attn}，最后{DIFF_LORA_LAST_LAYERS}层×4投影)')
+            # 验证：cond_emb 不注入，diff_estimator 最后 N 层注入
+            if cond_n != 0:
+                print(f'  [FAIL] cond_emb 被错误注入 LoRA')
+                all_passed = False
+            if attn_n != expected_attn:
+                print(f'  [FAIL] diff_estimator LoRA 注入数量不符: {attn_n} != {expected_attn}')
                 all_passed = False
 
             # 设置非零 LoRA_B
