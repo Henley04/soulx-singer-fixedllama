@@ -1561,8 +1561,20 @@ def prepare_datasets(include_pjs=True, include_jsut=True, include_jvs=True,
 # ===========================================================================
 # LoRA 层实现（来自 lora.py）
 # ===========================================================================
+_LoRALinear_Class = None
+
 def _define_lora_linear():
-    """延迟定义 LoRALinear（需要 torch 已导入）。"""
+    """延迟定义 LoRALinear（需要 torch 已导入），并缓存类对象。
+
+    必须缓存：若每次调用都重新定义类，训练阶段 apply_lora_to_model 生成的实例
+    在导出阶段 merge_lora_into_base 的 isinstance 判断中会返回 False
+    （Class_A 实例 vs Class_B 类），导致 LoRA 权重未合并，ONNX 导出因
+    Unexpected key (lora_A/original.weight) 而 RuntimeError。
+    """
+    global _LoRALinear_Class
+    if _LoRALinear_Class is not None:
+        return _LoRALinear_Class
+
     class LoRALinear(nn.Module):
         """用低秩加性适配器包装一个 nn.Linear。"""
 
@@ -1591,6 +1603,7 @@ def _define_lora_linear():
         def merged_bias(self):
             return self.original.bias
 
+    _LoRALinear_Class = LoRALinear
     return LoRALinear
 
 
