@@ -2686,12 +2686,26 @@ def train_one_stage(stage, init_embed_path=None, resume_path=None, device='cuda'
     print(f'\nStage {stage} 训练完成. Best val loss: {best_val_loss:.4f}')
     print(f'Checkpoints in: {output_dir}/')
     empty_cache(device)
-    # 返回持久化路径（而非 output_dir 下的路径），确保后续 stage 能找到
+    # 返回 best checkpoint 路径，按优先级查找：
+    # 1. 持久化目录的 best（最可靠，不受 upload_output 清理影响）
+    # 2. output_dir 的 best
+    # 3. 持久化目录的 last（best 可能因早停时 is_best=False 未保存，
+    #    但 last 每 epoch 都保存，作为回退）
+    # 4. output_dir 的 last
     persist_best = os.path.join(
         _PERSISTENT_CKPT_DIR, f'stage{stage}', f'stage{stage}_best.pt')
-    if os.path.exists(persist_best):
-        return persist_best
-    return os.path.join(output_dir, f'stage{stage}_best.pt')
+    output_best = os.path.join(output_dir, f'stage{stage}_best.pt')
+    persist_last = os.path.join(
+        _PERSISTENT_CKPT_DIR, f'stage{stage}', f'stage{stage}_last.pt')
+    output_last = os.path.join(output_dir, f'stage{stage}_last.pt')
+    for candidate in [persist_best, output_best, persist_last, output_last]:
+        if os.path.exists(candidate):
+            if 'best' not in candidate:
+                print(f'  [WARNING] best checkpoint 不存在，回退到 last: {candidate}')
+            return candidate
+    raise FileNotFoundError(
+        f'Stage {stage} 训练完成但找不到任何 checkpoint：'
+        f'已尝试 {persist_best}, {output_best}, {persist_last}, {output_last}')
 
 
 def train_all_stages(device='cuda'):
@@ -2820,6 +2834,36 @@ def export_onnx_files(checkpoint_path, device='cpu'):
     print('导出 ONNX 模型')
     print('=' * 60)
     os.makedirs(ONNX_OUTPUT_DIR, exist_ok=True)
+
+    # checkpoint 路径回退查找：c2net upload_output 可能清理 /tmp/output，
+    # 若传入路径不存在，从持久化目录和各 stage 目录查找任意可用 .pt
+    if not os.path.exists(checkpoint_path):
+        print(f'  [WARNING] checkpoint 不存在: {checkpoint_path}')
+        candidates = []
+        # 从路径推断 stage 号
+        import re
+        m = re.search(r'stage(\d+)', checkpoint_path)
+        stage_num = m.group(1) if m else '3'
+        # 持久化目录
+        persist_dir = os.path.join(_PERSISTENT_CKPT_DIR, f'stage{stage_num}')
+        if os.path.isdir(persist_dir):
+            for f in sorted(os.listdir(persist_dir), reverse=True):
+                if f.endswith('.pt'):
+                    candidates.append(os.path.join(persist_dir, f))
+        # output 目录
+        output_dir = os.path.join(CHECKPOINT_DIR, f'stage{stage_num}')
+        if os.path.isdir(output_dir):
+            for f in sorted(os.listdir(output_dir), reverse=True):
+                if f.endswith('.pt'):
+                    candidates.append(os.path.join(output_dir, f))
+        # 优先 best，其次 last，最后 epoch
+        candidates.sort(key=lambda p: 0 if 'best' in p else (1 if 'last' in p else 2))
+        if candidates:
+            checkpoint_path = candidates[0]
+            print(f'  回退到: {checkpoint_path}')
+        else:
+            raise FileNotFoundError(
+                f'checkpoint 不存在且无回退候选: {checkpoint_path}')
 
     # 加载基础模型
     from soulxsinger.models.soulxsinger import SoulXSinger
