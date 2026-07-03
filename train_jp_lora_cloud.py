@@ -74,10 +74,8 @@ LORA_RANK = 32           # rank=32 提供更高容量用于 preflow 深度微调
 LORA_ALPHA = 64          # alpha = 2 * rank
 BATCH_SIZE = 8           # A100 40G（无 diff_estimator LoRA，显存充裕）
 GRADIENT_ACCUMULATION = 2  # 有效 batch = 16
-GRAD_CHECKPOINT = False  # 关闭：diff_estimator 虽冻结，但 cond_emb 可训练时
-                         # 梯度需穿过 diff_estimator 回传。checkpointing 能省
-                         # 激活显存，但 A100 40G + batch_size=8 显存充裕（见 L60），
-                         # 重计算是纯速度开销。若显存不足可改 True。
+GRAD_CHECKPOINT = True   # 恢复：GTSinger 2832 样本含长音频，关闭 checkpoint 导致
+                         # A100 40G OOM。开启后激活显存可显著降低，重计算开销可接受。
 VAL_RATIO = 0.1
 SEED = 42
 
@@ -2167,13 +2165,15 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, epoch, writ
     n_batches = 0
     use_amp = device.startswith('cuda') or device == 'npu'
     optimizer.zero_grad()
+    # 持久化最近一次 optimizer.step() 时的 embedding 梯度范数
+    # （避免 bi%10==0 打印时取到未更新的初始值 0.0）
+    last_embed_grad_norm = 0.0
     for bi, batch in enumerate(dataloader):
         if batch is None:
             continue
         waveform = batch.get('waveform')
         if waveform is None:
             continue
-        embed_grad_norm = 0.0  # 仅在 optimizer.step() 时更新
         try:
             with amp_context(device, enabled=use_amp, dtype=amp_dtype):
                 target_mel, x_mask, mel_feat = extract_features(model, batch, device)
@@ -2185,10 +2185,9 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, epoch, writ
             if (bi + 1) % gradient_accumulation == 0:
                 # 在 clip 前记录 embedding 梯度范数（验证 JP 嵌入是否真的在更新）
                 # 这是排查"jp_std 恒定"问题的关键诊断指标
-                embed_grad_norm = 0.0
                 embed_w = model.note_text_encoder.weight
                 if embed_w.grad is not None:
-                    embed_grad_norm = embed_w.grad.norm().item()
+                    last_embed_grad_norm = embed_w.grad.norm().item()
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], max_norm=1.0)
                 optimizer.step()
@@ -2199,14 +2198,14 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, epoch, writ
                 lr_now = optimizer.param_groups[0]['lr']
                 if writer is not None:
                     writer.add_scalar('train/learning_rate', lr_now, global_step)
-                    writer.add_scalar('train/embed_grad_norm', embed_grad_norm, global_step)
+                    writer.add_scalar('train/embed_grad_norm', last_embed_grad_norm, global_step)
             total_loss += loss.item()
             n_batches += 1
             if writer is not None:
                 writer.add_scalar('train/loss_step', loss.item(), epoch * 1000 + bi)
             if bi % 10 == 0:
                 print(f'  Epoch {epoch} [{bi}] loss={loss.item():.4f} '
-                      f'embed_grad={embed_grad_norm:.4f} '
+                      f'embed_grad={last_embed_grad_norm:.4f} '
                       f'split={use_prompt_split and (prompt_split_prob > 0)}')
         except RuntimeError as e:
             if 'device' in str(e).lower() or 'cuda' in str(e).lower() or 'npu' in str(e).lower():
