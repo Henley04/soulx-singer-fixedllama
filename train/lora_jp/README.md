@@ -17,6 +17,13 @@
 > **云端训练**：`SoulX-Singer/train_jp_lora_cloud.py` 是 c2net 云端一键训练脚本，
 > 在本地 `train/lora_jp/` 流水线基础上整合了 PJS+JSUT+JVS+GTSinger 数据准备与
 > 三阶段训练，支持 `--gtsinger_only` / `--no_gtsinger` 等开关。详见脚本顶部文档字符串。
+>
+> **v3.1 修复（Stage 2/3 resume 路径）**：原代码在 `load_checkpoint` 替换
+> `nn.Embedding` 之前注册 `zero_base_grad` hook 和构建 optimizer，导致 hook 失效、
+> optimizer 引用孤儿张量，JP 嵌入永不更新（jp_std 恒定 0.7984）。修复后顺序为
+> `apply_lora_structure → load_checkpoint → setup_trainable_and_hooks → build_optimizer
+> → restore_optimizer_state_by_name → verify_optimizer_embed_alignment`，并新增
+> embedding 梯度范数日志（`train/embed_grad_norm`）用于验证更新有效性。
 
 ## 文件结构
 

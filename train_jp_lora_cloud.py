@@ -44,6 +44,21 @@ lora.py / init_embeddings.py / dataset.py / train_lora.py / validate.py / export
   Stage 2（全量联合训练，50 ep）：JP embed + preflow LoRA + cond_emb 可训练
   Stage 3（prompt 条件化微调，20 ep）：100% prompt 切分训练
 
+Resume 路径关键顺序（v3.1 修复）：
+  Stage 2/3 从上一阶段 resume 时，load_checkpoint 可能替换 model.note_text_encoder
+  （当 checkpoint 的 embedding 行数大于 base 模型时）。若在 load_checkpoint 之前注册
+  zero_base_grad hook 或构建 optimizer，hook 会挂在 OLD 张量上（失效），optimizer 会
+  引用 OLD 张量（更新孤儿），导致 JP 嵌入永不更新（jp_std 恒定的根因）。
+
+  正确顺序：apply_lora_structure → load_checkpoint → setup_trainable_and_hooks
+            → build_optimizer → restore_optimizer_state_by_name → verify_optimizer_embed_alignment
+  - apply_lora_structure：仅注入 LoRA 模块（load_checkpoint 需要其存在以恢复 LoRA state）
+  - load_checkpoint(optimizer=None)：加载权重（可能替换 embedding），不恢复 optimizer state
+  - setup_trainable_and_hooks：在最终 embedding 张量上注册 hook + 设置 requires_grad
+  - build_optimizer：引用最终 embedding 张量
+  - restore_optimizer_state_by_name：延迟恢复 Adam 动量（写入最终张量）
+  - verify_optimizer_embed_alignment：断言 optimizer embed 组与 model embedding 一致
+
 数据集：
   - PJS Corpus（日语歌唱，主要数据源，100 样本已预处理）
 https://www.modelscope.cn/datasets/aihobbyist/StarRail_Dataset/resolve/master/StarRail4.2_JP.7z  #Genshin Impact JP Voice,modelscope highspeed download.
@@ -97,7 +112,9 @@ STAGE_CONFIGS = {
         'cond_emb_lr': 5e-5,   # cond_emb 全量微调（联合训练，低于 LoRA）
         'train_lora': True,
         'train_cond_emb': True,
-        'warmup_steps': 200,
+        # warmup 200→500：原 200 step 仅占总步数 2.4%，跨阶段 resume 后
+        # 嵌入张量被替换、optimizer state 部分丢失，更长 warmup 帮助嵌入平稳适应
+        'warmup_steps': 500,
         'use_prompt_split': True,
         'prompt_split_prob': 0.5,
         # 日志：原值 21 导致 stage2 前 12 epoch 无 prompt 训练（浪费 24%）
@@ -1900,8 +1917,24 @@ def collate_fn(batch):
 # ===========================================================================
 # 训练函数（来自 train_lora.py）
 # ===========================================================================
-def apply_lora_and_setup_trainable(model, stage):
-    """注入 LoRA 并按阶段设置 requires_grad。
+def apply_lora_structure(model, stage):
+    """仅注入 LoRA 结构（不设置 requires_grad / hook）。
+
+    用于 resume 路径：load_checkpoint 之前需要 LoRA 模块已存在以恢复状态，
+    但此时不能注册 embedding hook，因为 load_checkpoint 可能替换
+    model.note_text_encoder（当 checkpoint 的 embedding 行数大于当前模型时），
+    导致 hook 注册在即将被丢弃的 OLD 张量上。
+    """
+    replaced = apply_lora_to_model(model, rank=LORA_RANK, alpha=LORA_ALPHA)
+    print(f"  Applied LoRA (rank={LORA_RANK}, alpha={LORA_ALPHA}) to {len(replaced)} preflow layers")
+    return replaced
+
+
+def setup_trainable_and_hooks(model, stage):
+    """设置 requires_grad 并注册梯度保护 hook。
+
+    必须在 load_checkpoint 之后调用，确保 zero_base_grad hook 注册在
+    最终的 embedding 张量上（避免 hook 失效导致 JP 嵌入永不更新或源语言被污染）。
 
     训练目标分配：
       - preflow (encoder): LoRA 深度微调（按 stage 配置开关）
@@ -1913,8 +1946,6 @@ def apply_lora_and_setup_trainable(model, stage):
     for param in model.parameters():
         param.requires_grad = False
     cfg = STAGE_CONFIGS[stage]
-    replaced = apply_lora_to_model(model, rank=LORA_RANK, alpha=LORA_ALPHA)
-    print(f"  Applied LoRA (rank={LORA_RANK}, alpha={LORA_ALPHA}) to {len(replaced)} preflow layers")
 
     # preflow LoRA
     if cfg['train_lora']:
@@ -1936,13 +1967,15 @@ def apply_lora_and_setup_trainable(model, stage):
         print(f"  Stage {stage}: cond_emb (跨模态对齐层) 全量微调")
 
      # embedding 全量训练（仅 JP 行，base 行梯度置零保护源语言）
+    # 关键：此处获取的 embed_weight 是 load_checkpoint 之后的最终张量
     embed_weight = model.note_text_encoder.weight
     embed_weight.requires_grad = True
 
     # 从 phone_set 获取 JP token 的实际索引（不一定是 3000-3032）
     jp_indices = _get_jp_token_indices(PHONE_SET_PATH)
     print(f"  JP token indices: {len(jp_indices)} tokens "
-          f"(range {min(jp_indices)}-{max(jp_indices)})")
+          f"(range {min(jp_indices)}-{max(jp_indices)}), "
+          f"embed shape={embed_weight.shape}")
 
     def zero_base_grad(grad):
         grad = grad.clone()
@@ -1955,7 +1988,41 @@ def apply_lora_and_setup_trainable(model, stage):
 
     # diff_estimator (diffstep) 始终冻结 — 不在此处设置，已通过全局 requires_grad=False 冻结
     # vocoder 始终冻结 — 同上
-    return replaced
+    return jp_indices
+
+
+def apply_lora_and_setup_trainable(model, stage):
+    """注入 LoRA 并按阶段设置 requires_grad + hook（非 resume 路径便捷封装）。
+
+    等价于 apply_lora_structure → setup_trainable_and_hooks。
+    仅用于 stage 1 非 resume 路径（embedding 不会被后续替换）。
+    Resume 路径必须分步调用以避免 hook 失效。
+    """
+    apply_lora_structure(model, stage)
+    setup_trainable_and_hooks(model, stage)
+    return True
+
+
+def verify_optimizer_embed_alignment(model, optimizer):
+    """断言 optimizer 的 embed 组引用与当前 model.note_text_encoder.weight 一致。
+
+    防止 load_checkpoint 替换 embedding 后 optimizer 仍引用孤儿张量
+    （导致 JP 嵌入永不更新的根因）。
+    """
+    embed_weight = model.note_text_encoder.weight
+    for g in optimizer.param_groups:
+        if g.get('name') == 'embed':
+            for p in g['params']:
+                if p is not embed_weight:
+                    raise RuntimeError(
+                        f'optimizer embed 组引用了孤立的 embedding 张量！'
+                        f'optimizer.param={id(p)}, model.weight={id(embed_weight)}. '
+                        f'这通常因 load_checkpoint 在 build_optimizer 之后替换了 '
+                        f'nn.Embedding 导致。请检查 train_one_stage resume 路径顺序。')
+            print(f'  [Sanity] optimizer embed 组对齐正确 '
+                  f'(shape={embed_weight.shape}, params={len(g["params"])})')
+            return
+    print(f'  [Sanity] WARNING: optimizer 无 embed 组（可能全部冻结）')
 
 
 def count_trainable_params_v3(model, stage):
@@ -2106,6 +2173,7 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, epoch, writ
         waveform = batch.get('waveform')
         if waveform is None:
             continue
+        embed_grad_norm = 0.0  # 仅在 optimizer.step() 时更新
         try:
             with amp_context(device, enabled=use_amp, dtype=amp_dtype):
                 target_mel, x_mask, mel_feat = extract_features(model, batch, device)
@@ -2115,6 +2183,12 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, epoch, writ
                 loss_scaled = loss / gradient_accumulation
             loss_scaled.backward()
             if (bi + 1) % gradient_accumulation == 0:
+                # 在 clip 前记录 embedding 梯度范数（验证 JP 嵌入是否真的在更新）
+                # 这是排查"jp_std 恒定"问题的关键诊断指标
+                embed_grad_norm = 0.0
+                embed_w = model.note_text_encoder.weight
+                if embed_w.grad is not None:
+                    embed_grad_norm = embed_w.grad.norm().item()
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad], max_norm=1.0)
                 optimizer.step()
@@ -2125,12 +2199,14 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, device, epoch, writ
                 lr_now = optimizer.param_groups[0]['lr']
                 if writer is not None:
                     writer.add_scalar('train/learning_rate', lr_now, global_step)
+                    writer.add_scalar('train/embed_grad_norm', embed_grad_norm, global_step)
             total_loss += loss.item()
             n_batches += 1
             if writer is not None:
                 writer.add_scalar('train/loss_step', loss.item(), epoch * 1000 + bi)
             if bi % 10 == 0:
                 print(f'  Epoch {epoch} [{bi}] loss={loss.item():.4f} '
+                      f'embed_grad={embed_grad_norm:.4f} '
                       f'split={use_prompt_split and (prompt_split_prob > 0)}')
         except RuntimeError as e:
             if 'device' in str(e).lower() or 'cuda' in str(e).lower() or 'npu' in str(e).lower():
@@ -2246,6 +2322,7 @@ def _restore_partial_optimizer_state(optimizer, opt_state, cur_groups, saved_gro
     saved_flat_params = []
     for g in saved_groups:
         saved_flat_params.extend(g.get('params', []))
+    restored_count = 0
     for gi, cur_g in enumerate(cur_groups):
         gname = cur_g.get('name', f'group{gi}')
         if gname not in saved_by_name:
@@ -2262,6 +2339,44 @@ def _restore_partial_optimizer_state(optimizer, opt_state, cur_groups, saved_gro
                     k: v.clone() if torch.is_tensor(v) else v
                     for k, v in saved_state[spid].items()
                 }
+                restored_count += 1
+    print(f"  Restored Adam momentum for {restored_count} params by name matching")
+
+
+def restore_optimizer_state_by_name(optimizer, resume_path):
+    """从 checkpoint 延迟恢复 optimizer 状态（按参数组 name 匹配）。
+
+    用于 resume 路径：load_checkpoint（加载权重）→ setup_trainable_and_hooks
+    → build_optimizer（引用最终 embedding 张量）之后，再恢复 optimizer 动量。
+
+    与 load_checkpoint 内嵌的恢复逻辑不同，此函数保证 optimizer.state 写入
+    当前 optimizer 实际引用的张量（避免 embed 组写入孤儿张量）。
+
+    对于 embed 组：若 load_checkpoint 替换了 nn.Embedding，saved 的 Adam 动量
+    仍可恢复到新张量（动量描述的是梯度历史，权重数据本身已从 checkpoint 加载，
+    新旧张量的梯度统计在数据分布一致时近似有效）。
+    """
+    if not os.path.exists(resume_path):
+        print(f"  [OptState] {resume_path} 不存在，跳过 optimizer state 恢复")
+        return
+    ckpt = torch.load(resume_path, map_location='cpu', weights_only=False)
+    opt_state = ckpt.get('optimizer_state')
+    if opt_state is None:
+        print(f"  [OptState] checkpoint 无 optimizer_state，跳过")
+        return
+    cur_groups = optimizer.param_groups
+    saved_groups = opt_state.get('param_groups', [])
+    if len(saved_groups) == len(cur_groups):
+        try:
+            optimizer.load_state_dict(opt_state)
+            print(f"  [OptState] 完整恢复 optimizer state "
+                  f"(groups={len(cur_groups)})")
+            return
+        except Exception as e:
+            print(f"  [OptState] 完整恢复失败 ({e})，尝试按 name 部分恢复")
+    _restore_partial_optimizer_state(optimizer, opt_state, cur_groups, saved_groups)
+    print(f"  [OptState] 部分恢复 optimizer state "
+          f"(saved_groups={len(saved_groups)} -> cur_groups={len(cur_groups)})")
 
 
 def load_checkpoint(model, optimizer, resume_path, stage):
@@ -2396,12 +2511,25 @@ def train_one_stage(stage, init_embed_path=None, resume_path=None, device='cuda'
 
     # 加载 init embedding 或 resume
     if resume_path:
-        print('Applying LoRA structure before resume...')
-        apply_lora_and_setup_trainable(model, stage)
+        # 关键顺序：apply_lora_structure → load_checkpoint → setup_hooks → build_optimizer
+        # 原因：load_checkpoint 可能替换 model.note_text_encoder（当 checkpoint 的
+        # embedding 行数大于 base 模型时），若在此之前注册 hook 或构建 optimizer，
+        # hook 会挂在 OLD 张量上（失效），optimizer 会引用 OLD 张量（更新孤儿），
+        # 导致 JP 嵌入永不更新（jp_std 恒定的根因）。
+        print('Applying LoRA structure before resume (no hooks yet)...')
+        apply_lora_structure(model, stage)
         model = move_to_device(model, device)
+        # load_checkpoint 不传 optimizer，避免在 embedding 可能被替换前恢复 state
+        epoch_start, best_val_loss = load_checkpoint(model, None, resume_path, stage)
+        model = move_to_device(model, device)
+        # 现在 embedding 已是最终张量，注册 hook + 设置 requires_grad
+        print('Setting up trainable params + hooks (post-resume)...')
+        setup_trainable_and_hooks(model, stage)
         optimizer = build_optimizer(model, stage, cfg['lora_lr'], cfg['embed_lr'])
-        epoch_start, best_val_loss = load_checkpoint(model, optimizer, resume_path, stage)
-        model = move_to_device(model, device)
+        # 延迟恢复 optimizer state（保证写入最终张量）
+        restore_optimizer_state_by_name(optimizer, resume_path)
+        # sanity check：optimizer embed 组必须引用当前 embedding
+        verify_optimizer_embed_alignment(model, optimizer)
     else:
         if stage == 1:
             if init_embed_path and os.path.exists(init_embed_path):
@@ -2426,6 +2554,8 @@ def train_one_stage(stage, init_embed_path=None, resume_path=None, device='cuda'
         apply_lora_and_setup_trainable(model, stage)
         model = move_to_device(model, device)
         optimizer = build_optimizer(model, stage, cfg['lora_lr'], cfg['embed_lr'])
+        # sanity check（非 resume 路径也应验证）
+        verify_optimizer_embed_alignment(model, optimizer)
         epoch_start = 1
         best_val_loss = float('inf')
 
@@ -2494,19 +2624,19 @@ def train_one_stage(stage, init_embed_path=None, resume_path=None, device='cuda'
         print(f'Epoch {epoch}/{epoch_end} loss={avg_loss:.4f} '
               f'time={elapsed:.1f}s split={use_ps}(p={ps_prob})')
 
-        if epoch % 5 == 0:
-            jp_indices = _get_jp_token_indices(PHONE_SET_PATH)
-            if jp_indices:
-                jp_embed = model.note_text_encoder.weight.data[jp_indices]
-            else:
-                jp_embed = model.note_text_encoder.weight.data[
-                    JP_PHONEME_START:JP_PHONEME_START + JP_PHONEME_COUNT]
-            jp_std = jp_embed.std().item()
-            jp_norm = jp_embed.norm(dim=1).mean().item()
-            print(f'  [Embed] JP std={jp_std:.4f}, norm={jp_norm:.3f}')
-            if writer is not None:
-                writer.add_scalar('embed/jp_std', jp_std, epoch)
-                writer.add_scalar('embed/jp_mean_norm', jp_norm, epoch)
+        # 每 epoch 打印 JP 嵌入统计（原每 5 epoch，无法观察缓慢更新）
+        jp_indices = _get_jp_token_indices(PHONE_SET_PATH)
+        if jp_indices:
+            jp_embed = model.note_text_encoder.weight.data[jp_indices]
+        else:
+            jp_embed = model.note_text_encoder.weight.data[
+                JP_PHONEME_START:JP_PHONEME_START + JP_PHONEME_COUNT]
+        jp_std = jp_embed.std().item()
+        jp_norm = jp_embed.norm(dim=1).mean().item()
+        print(f'  [Embed] JP std={jp_std:.4f}, norm={jp_norm:.3f}')
+        if writer is not None:
+            writer.add_scalar('embed/jp_std', jp_std, epoch)
+            writer.add_scalar('embed/jp_mean_norm', jp_norm, epoch)
 
         # 每 epoch 验证（原每 2 epoch）：日志显示最佳点 ep8 在偶数 epoch，
         # 奇数 epoch 无验证可能错过更优 checkpoint
