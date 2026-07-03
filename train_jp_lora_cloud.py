@@ -2617,9 +2617,11 @@ def train_one_stage(stage, init_embed_path=None, resume_path=None, device='cuda'
 
     global_step = 0
     avg_loss = 0.0
-    # 早停：日志显示 stage1 ep8 后 val_loss 持续恶化（30.34→34.24），
-    # patience=8 避免在已过拟合时浪费训练资源
-    early_stop_patience = 8
+    # 早停 patience 按 stage 配置：
+    # - Stage 1 (8 epochs)：patience=2，避免过拟合后浪费算力
+    #   日志显示 ep6 val_loss 最低，ep7-8 过拟合（val 升高 train 降）
+    # - Stage 2/3：patience=8，长训练需要足够探索
+    early_stop_patience = 2 if stage == 1 else 8
     epochs_no_improve = 0
     for epoch in range(epoch_start, epoch_end + 1):
         t0 = time.time()
